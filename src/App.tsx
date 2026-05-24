@@ -27,16 +27,18 @@ import {
   Image as ImageIcon,
   Network,
   Palette,
+  Pause,
   Play,
   RotateCcw,
   Search,
   ShieldCheck,
+  StepBack,
+  StepForward,
   Sparkles,
-  Square,
   Workflow,
   ZoomIn,
 } from 'lucide-react';
-import type { ComponentType, CSSProperties } from 'react';
+import type { ComponentType, CSSProperties, PointerEvent } from 'react';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 
 type EventAttachment = {
@@ -208,6 +210,7 @@ const EVENTLINE_JSONL_ENDPOINT = '/eventline-data/events.jsonl';
 const EVENTLINE_TOOL_SCHEMA_ENDPOINT = '/eventline-data/tool-schema.json';
 const EVENTLINE_LAYOUT_STORAGE_KEY = 'eventline:demo:layout.json';
 const TREE_HIGHLIGHT_COLORS = ['#38bdf8', '#f43f5e', '#a78bfa', '#22c55e', '#f59e0b', '#06b6d4', '#ec4899'];
+const PLAYBACK_STEP_DELAY_MS = 720;
 const EVENTLINE_TOOL_NAMES: ToolName[] = [
   'eventline.create_tree',
   'eventline.upsert_node',
@@ -1527,6 +1530,25 @@ function replayJsonlEvents(events: EventlineJsonlEvent[]): { graph: EventlineGra
   return { graph, notices };
 }
 
+function replayJsonlEventsFrame(events: EventlineJsonlEvent[], frame: number): { graph: EventlineGraph; notices: string[]; changedNodeIds: string[] } {
+  let graph = EMPTY_GRAPH;
+  const notices: string[] = [];
+  let changedNodeIds: string[] = [];
+  const end = Math.max(0, Math.min(frame, events.length));
+
+  for (let index = 0; index < end; index += 1) {
+    const event = events[index];
+    const result = applyToolCallToGraph(graph, jsonlEventToToolCall(event));
+    graph = result.graph;
+    changedNodeIds = result.changedNodeIds;
+    if (result.notice) {
+      notices.push(`seq ${event.seq}: ${result.notice}`);
+    }
+  }
+
+  return { graph, notices, changedNodeIds };
+}
+
 function readStoredEvents(): EventlineJsonlEvent[] {
   const raw = window.localStorage.getItem(EVENTLINE_JSONL_STORAGE_KEY);
   return raw
@@ -2518,6 +2540,86 @@ function TreeFilterMenu({
   );
 }
 
+function EventPlaybackBar({
+  frame,
+  totalFrames,
+  isPlaying,
+  onTogglePlay,
+  onPrevious,
+  onNext,
+  onReset,
+  onSeek,
+}: {
+  frame: number;
+  totalFrames: number;
+  isPlaying: boolean;
+  onTogglePlay: () => void;
+  onPrevious: () => void;
+  onNext: () => void;
+  onReset: () => void;
+  onSeek: (frame: number) => void;
+}) {
+  const progress = totalFrames > 0 ? (frame / totalFrames) * 100 : 0;
+  const seekFromPointer = useCallback((event: PointerEvent<HTMLInputElement>) => {
+    if (totalFrames === 0) {
+      return;
+    }
+    const rect = event.currentTarget.getBoundingClientRect();
+    const ratio = rect.width > 0 ? (event.clientX - rect.left) / rect.width : 0;
+    const nextFrame = Math.max(0, Math.min(totalFrames, Math.round(ratio * totalFrames)));
+    onSeek(nextFrame);
+  }, [onSeek, totalFrames]);
+
+  return (
+    <div className="event-playback-bar" aria-label="Event playback controls">
+      <div className="event-playback-buttons">
+        <button type="button" className="icon-action" onClick={onReset} disabled={frame === 0 && !isPlaying} aria-label="Reset playback">
+          <RotateCcw size={14} />
+        </button>
+        <button type="button" className="icon-action" onClick={onPrevious} disabled={frame <= 0} aria-label="Previous event">
+          <StepBack size={14} />
+        </button>
+        <button
+          type="button"
+          className="icon-action is-primary"
+          onClick={onTogglePlay}
+          disabled={totalFrames === 0}
+          aria-label={isPlaying ? 'Pause playback' : 'Play events'}
+        >
+          {isPlaying ? <Pause size={14} /> : <Play size={14} />}
+        </button>
+        <button type="button" className="icon-action" onClick={onNext} disabled={frame >= totalFrames} aria-label="Next event">
+          <StepForward size={14} />
+        </button>
+      </div>
+      <div className="event-playback-track-wrap">
+        <input
+          className="event-playback-range"
+          type="range"
+          min={0}
+          max={Math.max(totalFrames, 0)}
+          step={1}
+          value={Math.min(frame, totalFrames)}
+          onPointerDown={seekFromPointer}
+          onPointerMove={(event) => {
+            if (event.buttons === 1) {
+              seekFromPointer(event);
+            }
+          }}
+          onInput={(event) => onSeek(Number(event.currentTarget.value))}
+          onChange={(event) => onSeek(Number(event.currentTarget.value))}
+          style={{ '--event-playback-progress': `${progress}%` } as CSSProperties}
+          aria-label="Jump to event frame"
+        />
+        <div className="event-playback-meta">
+          <span>{frame}/{totalFrames}</span>
+          <span>{totalFrames === 1 ? 'event' : 'events'}</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ToolSchemaItem({
   item,
   value,
@@ -2564,13 +2666,9 @@ function ToolPanel({
   toolSchemaItems,
   schemaTestInputs,
   schemaTestErrors,
-  isPlaying,
-  playIndex,
   onSchemaTestInputChange,
   onRunSchemaTest,
   onReplaySample,
-  onReplayCurrent,
-  onStopPlayback,
   onResetLayout,
 }: {
   graph: EventlineGraph;
@@ -2580,13 +2678,9 @@ function ToolPanel({
   toolSchemaItems: ToolSchemaItemDefinition[];
   schemaTestInputs: Record<string, string>;
   schemaTestErrors: Record<string, string>;
-  isPlaying: boolean;
-  playIndex: number;
   onSchemaTestInputChange: (toolId: string, value: string) => void;
   onRunSchemaTest: (toolId: string) => void;
   onReplaySample: () => void;
-  onReplayCurrent: () => void;
-  onStopPlayback: () => void;
   onResetLayout: () => void;
 }) {
   const eventLines = jsonlLines(eventJsonl);
@@ -2609,20 +2703,11 @@ function ToolPanel({
       <div className="tool-panel-section">
         <div className="section-head">
           <h2>Playback</h2>
-          {isPlaying ? <span className="playback-index">step {playIndex + 1}</span> : null}
         </div>
         <div className="tool-actions">
-          <button type="button" className="primary-action" onClick={onReplaySample} disabled={isPlaying}>
+          <button type="button" className="primary-action" onClick={onReplaySample}>
             <Play size={14} />
-            Sample
-          </button>
-          <button type="button" onClick={onReplayCurrent} disabled={isPlaying || script.length === 0}>
-            <RotateCcw size={14} />
-            Current
-          </button>
-          <button type="button" onClick={onStopPlayback} disabled={!isPlaying}>
-            <Square size={14} />
-            Stop
+            Load Sample
           </button>
           <button type="button" onClick={onResetLayout}>
             Reset Layout
@@ -2730,7 +2815,7 @@ function EventlineCanvas() {
   const [isAccessResultOpen, setIsAccessResultOpen] = useState(false);
   const [parseError, setParseError] = useState(initialReplay.notices.join('\n'));
   const [isPlaying, setIsPlaying] = useState(false);
-  const [playIndex, setPlayIndex] = useState(-1);
+  const [playbackFrame, setPlaybackFrame] = useState(initialEvents.length);
   const [theme, setTheme] = useState<EventlineTheme>('DARK');
   const [visibleTreeIds, setVisibleTreeIds] = useState<Set<string>>(() => new Set(initialReplay.graph.treeOrder));
   const [highlightedTreeIds, setHighlightedTreeIds] = useState<Set<string>>(new Set());
@@ -2779,15 +2864,6 @@ function EventlineCanvas() {
     });
   }, [graphTreeIds]);
 
-  const applyEventFileEvents = useCallback((events: EventlineJsonlEvent[]) => {
-    const replayed = replayJsonlEvents(events);
-    setEventLog(events);
-    setEventJsonl(eventsToJsonl(events));
-    setScript(events.map(jsonlEventToToolCall));
-    setGraph(applyStoredLayout(replayed.graph, layoutOverrides));
-    setParseError(replayed.notices.join('\n'));
-  }, [layoutOverrides]);
-
   const markChanged = useCallback((ids: string[]) => {
     const uniqueIds = Array.from(new Set(ids.filter(Boolean)));
     if (uniqueIds.length === 0) {
@@ -2806,6 +2882,26 @@ function EventlineCanvas() {
       });
     }, 1400);
   }, []);
+
+  const applyPlaybackFrame = useCallback((events: EventlineJsonlEvent[], frame: number, shouldMarkChanged = false) => {
+    const replayed = replayJsonlEventsFrame(events, frame);
+    setPlaybackFrame(Math.max(0, Math.min(frame, events.length)));
+    setGraph(applyStoredLayout(replayed.graph, layoutOverrides));
+    setParseError(replayed.notices.join('\n'));
+    if (shouldMarkChanged) {
+      markChanged(replayed.changedNodeIds);
+    }
+  }, [layoutOverrides, markChanged]);
+
+  const applyEventFileEvents = useCallback((events: EventlineJsonlEvent[]) => {
+    const replayed = replayJsonlEventsFrame(events, events.length);
+    setEventLog(events);
+    setEventJsonl(eventsToJsonl(events));
+    setScript(events.map(jsonlEventToToolCall));
+    setPlaybackFrame(events.length);
+    setGraph(applyStoredLayout(replayed.graph, layoutOverrides));
+    setParseError(replayed.notices.join('\n'));
+  }, [layoutOverrides]);
 
   useLayoutEffect(() => {
     let cancelled = false;
@@ -2830,11 +2926,12 @@ function EventlineCanvas() {
   }, [applyEventFileEvents, eventLog]);
 
   const replaceEventLog = useCallback((events: EventlineJsonlEvent[], changedIds: string[] = []) => {
-    const replayed = replayJsonlEvents(events);
+    const replayed = replayJsonlEventsFrame(events, events.length);
     const jsonl = writeStoredEvents(events);
     setEventLog(events);
     setEventJsonl(jsonl);
     setScript(events.map(jsonlEventToToolCall));
+    setPlaybackFrame(events.length);
     setGraph(applyStoredLayout(replayed.graph, layoutOverrides));
     setParseError(replayed.notices.join('\n'));
     markChanged(changedIds);
@@ -2860,6 +2957,7 @@ function EventlineCanvas() {
     const jsonl = writeStoredEvents(nextEvents);
     setEventLog(nextEvents);
     setEventJsonl(jsonl);
+    setPlaybackFrame(nextEvents.length);
     setGraph(applyStoredLayout(nextGraph, layoutOverrides));
     markChanged(changed);
     setScript(nextEvents.map(jsonlEventToToolCall));
@@ -2910,57 +3008,85 @@ function EventlineCanvas() {
     }
   }, [appendCallsToLog, graph, schemaTestInputs, toolSchemaItems]);
 
-  const runPlayback = useCallback(async (calls: EventlineReplayCall[]) => {
+  const runPlaybackFromFrame = useCallback((startFrame: number) => {
+    if (eventLog.length === 0) {
+      return;
+    }
     const runId = playbackRunRef.current + 1;
     playbackRunRef.current = runId;
     setIsPlaying(true);
-    setPlayIndex(-1);
     setActiveNodeId(null);
     setPinnedNodeIds(new Set());
-    setGraph(EMPTY_GRAPH);
-    await new Promise((resolve) => window.setTimeout(resolve, 360));
 
-    let nextGraph = EMPTY_GRAPH;
-    for (let index = 0; index < calls.length; index += 1) {
+    const tick = (frame: number) => {
       if (playbackRunRef.current !== runId) {
-        break;
+        return;
       }
-      const result = applyToolCallToGraph(nextGraph, calls[index]);
-      nextGraph = result.graph;
-      setGraph(nextGraph);
-      setPlayIndex(index);
-      markChanged(result.changedNodeIds);
-      await new Promise((resolve) => window.setTimeout(resolve, 820));
+      const nextFrame = Math.min(frame + 1, eventLog.length);
+      applyPlaybackFrame(eventLog, nextFrame, true);
+      if (nextFrame >= eventLog.length) {
+        setIsPlaying(false);
+        window.setTimeout(() => fitView({ padding: 0.18, duration: 500 }), 80);
+        return;
+      }
+      window.setTimeout(() => tick(nextFrame), PLAYBACK_STEP_DELAY_MS);
+    };
+
+    if (startFrame >= eventLog.length) {
+      applyPlaybackFrame(eventLog, 0);
+      window.setTimeout(() => tick(0), 180);
+      return;
     }
 
-    if (playbackRunRef.current === runId) {
-      setIsPlaying(false);
-      setPlayIndex(-1);
-      window.setTimeout(() => fitView({ padding: 0.18, duration: 500 }), 80);
-    }
-  }, [fitView, markChanged]);
+    tick(Math.max(0, startFrame));
+  }, [applyPlaybackFrame, eventLog, fitView]);
 
   const handleReplaySample = useCallback(() => {
     const events = sampleScript.map((call, index) => toolCallToJsonlEvent(call, index + 1));
     replaceEventLog(events);
-    void runPlayback(sampleScript);
-  }, [replaceEventLog, runPlayback]);
+  }, [replaceEventLog]);
 
-  const handleReplayCurrent = useCallback(() => {
-    void runPlayback(script);
-  }, [runPlayback, script]);
-
-  const handleStopPlayback = useCallback(() => {
+  const handlePausePlayback = useCallback(() => {
     playbackRunRef.current += 1;
     setIsPlaying(false);
-    setPlayIndex(-1);
   }, []);
+
+  const handleTogglePlayback = useCallback(() => {
+    if (isPlaying) {
+      handlePausePlayback();
+      return;
+    }
+    runPlaybackFromFrame(playbackFrame);
+  }, [handlePausePlayback, isPlaying, playbackFrame, runPlaybackFromFrame]);
+
+  const handleSeekPlayback = useCallback((frame: number) => {
+    handlePausePlayback();
+    setActiveNodeId(null);
+    applyPlaybackFrame(eventLog, frame, true);
+  }, [applyPlaybackFrame, eventLog, handlePausePlayback]);
+
+  const handlePreviousPlaybackFrame = useCallback(() => {
+    handleSeekPlayback(Math.max(0, playbackFrame - 1));
+  }, [handleSeekPlayback, playbackFrame]);
+
+  const handleNextPlaybackFrame = useCallback(() => {
+    handleSeekPlayback(Math.min(eventLog.length, playbackFrame + 1));
+  }, [eventLog.length, handleSeekPlayback, playbackFrame]);
+
+  const handleResetPlayback = useCallback(() => {
+    handlePausePlayback();
+    setActiveNodeId(null);
+    setPinnedNodeIds(new Set());
+    applyPlaybackFrame(eventLog, 0);
+  }, [applyPlaybackFrame, eventLog, handlePausePlayback]);
 
   const handleResetLayout = useCallback(() => {
     clearStoredLayout();
     setLayoutOverrides({});
-    setGraph(replayJsonlEvents(eventLog).graph);
-  }, [eventLog]);
+    const replayed = replayJsonlEventsFrame(eventLog, playbackFrame);
+    setGraph(replayed.graph);
+    setParseError(replayed.notices.join('\n'));
+  }, [eventLog, playbackFrame]);
 
   const handleToggleTheme = useCallback(() => {
     setTheme((prev) => {
@@ -3068,6 +3194,16 @@ function EventlineCanvas() {
             <Workflow size={16} />
             <span>Project Eventline</span>
           </div>
+          <EventPlaybackBar
+            frame={playbackFrame}
+            totalFrames={eventLog.length}
+            isPlaying={isPlaying}
+            onTogglePlay={handleTogglePlayback}
+            onPrevious={handlePreviousPlaybackFrame}
+            onNext={handleNextPlaybackFrame}
+            onReset={handleResetPlayback}
+            onSeek={handleSeekPlayback}
+          />
           <div className="flow-toolbar-actions">
             <TreeFilterMenu
               graph={graph}
@@ -3161,13 +3297,9 @@ function EventlineCanvas() {
         toolSchemaItems={toolSchemaItems}
         schemaTestInputs={schemaTestInputs}
         schemaTestErrors={schemaTestErrors}
-        isPlaying={isPlaying}
-        playIndex={playIndex}
         onSchemaTestInputChange={handleSchemaTestInputChange}
         onRunSchemaTest={handleRunSchemaTest}
         onReplaySample={handleReplaySample}
-        onReplayCurrent={handleReplayCurrent}
-        onStopPlayback={handleStopPlayback}
         onResetLayout={handleResetLayout}
       />
     </div>
