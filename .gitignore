@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.vite/
+.venv/
+*.egg-info/
+__pycache__/
+*.pyc
+tests/codex-eventline-trace.jsonl
+tests/codex-eventline-last-message.md

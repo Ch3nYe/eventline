@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="320" viewBox="0 0 720 320" role="img" aria-label="sample evidence">
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#171717"/>
+      <stop offset="1" stop-color="#101010"/>
+    </linearGradient>
+    <linearGradient id="line" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0" stop-color="#ff3d81"/>
+      <stop offset=".5" stop-color="#f8c537"/>
+      <stop offset="1" stop-color="#20e3d2"/>
+    </linearGradient>
+  </defs>
+  <rect width="720" height="320" fill="url(#bg)"/>
+  <g fill="none" stroke="#2a2a2a" stroke-width="1">
+    <path d="M0 64H720M0 128H720M0 192H720M0 256H720"/>
+    <path d="M90 0V320M180 0V320M270 0V320M360 0V320M450 0V320M540 0V320M630 0V320"/>
+  </g>
+  <path d="M80 168 C170 72 245 80 312 148 S475 248 610 110" stroke="url(#line)" stroke-width="8" stroke-linecap="round" fill="none"/>
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="16" fill="#f7f7f2">
+    <rect x="60" y="138" width="150" height="56" rx="8" fill="#121212" stroke="#ff3d81"/>
+    <text x="82" y="172">brief</text>
+    <rect x="288" y="118" width="150" height="56" rx="8" fill="#121212" stroke="#f8c537"/>
+    <text x="314" y="152">constraint</text>
+    <rect x="536" y="82" width="150" height="56" rx="8" fill="#121212" stroke="#20e3d2"/>
+    <text x="568" y="116">outcome</text>
+  </g>
+</svg>

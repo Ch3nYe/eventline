@@ -1,0 +1,9 @@
+[mcp_servers.eventline]
+command = "uv"
+args = [
+  "run",
+  "python",
+  "mcp_server.py",
+  "--events",
+  "data/events.jsonl",
+]
