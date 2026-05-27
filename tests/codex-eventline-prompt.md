@@ -7,6 +7,7 @@
 - 必须按事件发生顺序逐个构造 eventline tree。创建一个新事件 node 后，应立即用 `after` 参数或 `eventline.connect_events` 把它连接到已存在的前序事件。
 - 不要先批量创建所有 node，再集中补全部 edge。这样会让实时 UI 在 agent 执行过程中只看到一堆散点，而看不到事件演进。
 - 对线性主线，优先在 `eventline.upsert_node` 中使用 `after` 和 `edge_label` 直接连接前序 node。
+- 调用 `eventline.upsert_node` 时必须使用扁平参数：`node_id`、`tree_id`、`title`、`detail`、`from_agent` 等字段直接位于 params 第一层；不要使用 `id` 字段，也不要把节点字段包进 `node` 对象。
 - 对分支、跨 tree 连接、或需要补充关系的情况，再使用 `eventline.connect_events`。
 - 如果某个错误事件需要删除，请先创建它、创建它的后继节点、连接二者，然后再调用 `eventline.delete` 删除错误事件本身，以测试后继节点是否保留。
 

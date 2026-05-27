@@ -5,5 +5,10 @@ dist/
 *.egg-info/
 __pycache__/
 *.pyc
+.DS_Store
 tests/codex-eventline-trace.jsonl
+tests/codex-eventline-trace-*.jsonl
 tests/codex-eventline-last-message.md
+tests/codex-eventline-last-message-*.md
+tests/events-*.jsonl
+data/exports/

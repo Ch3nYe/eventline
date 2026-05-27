@@ -1,12 +1,15 @@
 import {
   Background,
+  ControlButton,
   Controls,
   EdgeLabelRenderer,
   Handle,
   MiniMap,
+  PanOnScrollMode,
   Position,
   ReactFlow,
   ReactFlowProvider,
+  SelectionMode,
   type Edge,
   type EdgeProps,
   type Node,
@@ -21,10 +24,13 @@ import {
   Bug,
   CalendarClock,
   CheckCircle2,
+  Download,
   FileText,
   Flag,
   GitBranch,
   Image as ImageIcon,
+  Minimize2,
+  MousePointer2,
   Network,
   Palette,
   Pause,
@@ -32,14 +38,22 @@ import {
   RotateCcw,
   Search,
   ShieldCheck,
+  Camera,
   StepBack,
   StepForward,
   Sparkles,
   Workflow,
-  ZoomIn,
+  X,
 } from 'lucide-react';
 import type { ComponentType, CSSProperties, PointerEvent } from 'react';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+
+declare global {
+  interface Window {
+    __eventlineExportReady?: boolean;
+    __eventlineExportStatus?: string;
+  }
+}
 
 type EventAttachment = {
   type: 'file' | 'image';
@@ -111,7 +125,7 @@ type EventlineJsonlEvent = {
   seq: number;
   project_id: string;
   at: string;
-  from: string;
+  from_agent: string;
   tool: JsonlToolName;
   arguments: Record<string, unknown>;
 };
@@ -120,12 +134,12 @@ type EventlineReplayCall = Omit<EventlineToolCall, 'tool'> & {
   tool: JsonlToolName;
 };
 
-type AccessMode = 'full' | 'brief';
+type AccessMode = 'full' | 'brief' | 'img';
 
 type EventlineAccessArgs = {
   mode?: AccessMode;
-  treeId?: string;
-  nodeId?: string;
+  tree_id?: string;
+  node_id?: string;
 };
 
 type ApplyResult = {
@@ -137,8 +151,11 @@ type ApplyResult = {
 type EventNodeData = EventNodeRecord & {
   isChanged: boolean;
   isPinned: boolean;
+  isSelected: boolean;
+  isSelectMode: boolean;
   isTreeHighlighted: boolean;
   treeHighlightColor: string;
+  onSelectNode: (nodeId: string, shouldExtendSelection: boolean) => void;
   onTogglePinned: (nodeId: string) => void;
 };
 
@@ -184,7 +201,6 @@ type RectLike = {
   width: number;
   height: number;
 };
-
 const NODE_WIDTH = 58;
 const NODE_HEIGHT = 58;
 const TREE_GAP = 420;
@@ -193,11 +209,21 @@ const LANE_GAP = 168;
 const DEFAULT_LAYOUT_RIGHT_EDGE = 1450;
 const TOOLTIP_GAP = 14;
 const ATTACHMENT_URI_PREFIX = '...';
+const INTERACTIVE_FIT_VIEW_OPTIONS = {
+  padding: {
+    top: '124px',
+    right: '72px',
+    bottom: '84px',
+    left: '72px',
+  },
+  duration: 500,
+} as const;
 const DEFAULT_TOOLTIP_POSITION: TooltipPosition = {
   left: NODE_WIDTH - 12,
   top: NODE_HEIGHT - 12,
   placement: 'bottom-right',
 };
+
 const EMPTY_GRAPH: EventlineGraph = {
   trees: {},
   treeOrder: [],
@@ -208,6 +234,7 @@ const EVENTLINE_PROJECT_ID = 'eventline-demo';
 const EVENTLINE_JSONL_STORAGE_KEY = 'eventline:demo:events.jsonl';
 const EVENTLINE_JSONL_ENDPOINT = '/eventline-data/events.jsonl';
 const EVENTLINE_TOOL_SCHEMA_ENDPOINT = '/eventline-data/tool-schema.json';
+const EVENTLINE_IMAGE_EXPORT_ENDPOINT = '/eventline-data/export-image';
 const EVENTLINE_LAYOUT_STORAGE_KEY = 'eventline:demo:layout.json';
 const TREE_HIGHLIGHT_COLORS = ['#38bdf8', '#f43f5e', '#a78bfa', '#22c55e', '#f59e0b', '#06b6d4', '#ec4899'];
 const PLAYBACK_STEP_DELAY_MS = 720;
@@ -218,6 +245,8 @@ const EVENTLINE_TOOL_NAMES: ToolName[] = [
   'eventline.delete',
 ];
 const LEGACY_EVENTLINE_TOOL_NAMES: LegacyToolName[] = ['eventline.move_node', 'eventline.clear_canvas'];
+const BACKEND_EXPORT_PARAM = 'eventline_export';
+const BACKEND_EXPORT_MODE = 'backend';
 const TOOL_SCHEMA_ITEMS: ToolSchemaItemDefinition[] = [
   {
     id: 'access',
@@ -225,16 +254,16 @@ const TOOL_SCHEMA_ITEMS: ToolSchemaItemDefinition[] = [
     title: 'eventline.access',
     schema: `{
   "tool": "eventline.access",
-  "from": "orchestrator",
+  "from_agent": "orchestrator",
   "arguments": {
-    "mode": "full | brief; defaults to full",
-    "treeId": "optional tree id; exclusive with nodeId",
-    "nodeId": "optional node id; full mode only"
+    "mode": "full | brief | img; defaults to full",
+    "tree_id": "optional tree id; exclusive with node_id; unavailable for img",
+    "node_id": "optional node id; full mode only; unavailable for img"
   }
 }`,
     testInput: `{
   "tool": "eventline.access",
-  "from": "manual_reader",
+  "from_agent": "manual_reader",
   "arguments": {
     "mode": "full"
   }
@@ -246,18 +275,18 @@ const TOOL_SCHEMA_ITEMS: ToolSchemaItemDefinition[] = [
     title: 'eventline.create_tree',
     schema: `{
   "tool": "eventline.create_tree",
-  "from": "orchestrator",
+  "from_agent": "orchestrator",
   "at": "optional ISO timestamp",
   "arguments": {
-    "treeId": "project-main",
+    "tree_id": "project-main",
     "title": "Project Progress"
   }
 }`,
     testInput: `{
   "tool": "eventline.create_tree",
-  "from": "manual_orchestrator",
+  "from_agent": "manual_orchestrator",
   "arguments": {
-    "treeId": "manual-tree",
+    "tree_id": "manual-tree",
     "title": "Manual Test Tree"
   }
 }`,
@@ -268,16 +297,16 @@ const TOOL_SCHEMA_ITEMS: ToolSchemaItemDefinition[] = [
     title: 'eventline.upsert_node',
     schema: `{
   "tool": "eventline.upsert_node",
-  "from": "agent",
+  "from_agent": "agent",
   "at": "optional ISO timestamp",
   "arguments": {
-    "id": "event-id",
-    "treeId": "project-main",
+    "node_id": "event-id",
+    "tree_id": "project-main",
     "title": "short title",
     "detail": "long detail",
     "icon": "bug | file | branch | ... | 🧪 | 🧪🔍",
     "after": "previous-event-id",
-    "edgeLabel": "line label",
+    "edge_label": "line label",
     "attachments": [
       { "type": "file", "label": "trace", "uri": "/path/file.md" },
       { "type": "image", "label": "snapshot", "uri": "/image.svg" }
@@ -286,15 +315,15 @@ const TOOL_SCHEMA_ITEMS: ToolSchemaItemDefinition[] = [
 }`,
     testInput: `{
   "tool": "eventline.upsert_node",
-  "from": "manual_agent",
+  "from_agent": "manual_agent",
   "arguments": {
-    "id": "manual-node",
-    "treeId": "project-main",
+    "node_id": "manual-node",
+    "tree_id": "project-main",
     "icon": "🧪",
     "title": "Manual node",
     "detail": "A node created from the schema test box.",
     "after": "task-received",
-    "edgeLabel": "manual test"
+    "edge_label": "manual test"
   }
 }`,
   },
@@ -304,23 +333,23 @@ const TOOL_SCHEMA_ITEMS: ToolSchemaItemDefinition[] = [
     title: 'eventline.connect_events',
     schema: `{
   "tool": "eventline.connect_events",
-  "from": "retrospector",
+  "from_agent": "retrospector",
   "at": "optional ISO timestamp",
   "arguments": {
     "id": "optional edge id",
     "source": "source-node-id",
     "target": "target-node-id",
-    "treeId": "edge owner tree id",
+    "tree_id": "edge owner tree id",
     "label": "line label"
   }
 }`,
     testInput: `{
   "tool": "eventline.connect_events",
-  "from": "manual_reviewer",
+  "from_agent": "manual_reviewer",
   "arguments": {
     "source": "project-kickoff",
     "target": "prototype-ready",
-    "treeId": "project-main",
+    "tree_id": "project-main",
     "label": "manual link"
   }
 }`,
@@ -331,19 +360,19 @@ const TOOL_SCHEMA_ITEMS: ToolSchemaItemDefinition[] = [
     title: 'eventline.delete',
     schema: `{
   "tool": "eventline.delete",
-  "from": "critic",
+  "from_agent": "critic",
   "at": "optional ISO timestamp",
   "arguments": {
-    "nodeId": "optional node id; deletes this node and its incoming/outgoing edges",
-    "edgeId": "optional edge id; exclusive with nodeId",
+    "node_id": "optional node id; deletes this node and its incoming/outgoing edges",
+    "edge_id": "optional edge id; exclusive with node_id",
     "reason": "optional deletion reason"
   }
 }`,
     testInput: `{
   "tool": "eventline.delete",
-  "from": "manual_critic",
+  "from_agent": "manual_critic",
   "arguments": {
-    "edgeId": "edge_project-kickoff_prototype-ready_9835e8d2",
+    "edge_id": "edge_project-kickoff_prototype-ready_9835e8d2",
     "reason": "schema test edge delete"
   }
 }`,
@@ -408,7 +437,7 @@ const sampleScript: EventlineToolCall[] = [
     from: 'orchestrator',
     at: '2026-05-24T08:54:57.524Z',
     arguments: {
-      treeId: 'eventline-session-history',
+      tree_id: 'eventline-session-history',
       title: '当前会话事件历史浓缩',
     },
   },
@@ -417,8 +446,8 @@ const sampleScript: EventlineToolCall[] = [
     from: 'orchestrator',
     at: '2026-05-24T08:55:04.660Z',
     arguments: {
-      id: 'esh-01-request-project-eventline-demo',
-      treeId: 'eventline-session-history',
+      node_id: 'esh-01-request-project-eventline-demo',
+      tree_id: 'eventline-session-history',
       icon: '🧭',
       title: '提出项目级 eventline demo 需求',
       detail: '用户要求构建基于 XYFlow 的 project-level eventline demo，让 multi-agent 能通过 MCP 工具维护事件脉络图。',
@@ -429,13 +458,13 @@ const sampleScript: EventlineToolCall[] = [
     from: 'frontend-agent',
     at: '2026-05-24T08:55:15.602Z',
     arguments: {
-      id: 'esh-02-ui-dag-baseline',
-      treeId: 'eventline-session-history',
+      node_id: 'esh-02-ui-dag-baseline',
+      tree_id: 'eventline-session-history',
       icon: 'workflow',
       title: '完成横向 DAG 基线',
       detail: '前端先实现横向 DAG 画布，把事件节点和依赖关系可视化为可拖拽、可浏览的 eventline 原型。',
       after: 'esh-01-request-project-eventline-demo',
-      edgeLabel: 'prototype',
+      edge_label: 'prototype',
     },
   },
   {
@@ -443,13 +472,13 @@ const sampleScript: EventlineToolCall[] = [
     from: 'frontend-agent',
     at: '2026-05-24T08:55:26.526Z',
     arguments: {
-      id: 'esh-03-ui-hover-versions-attachments',
-      treeId: 'eventline-session-history',
+      node_id: 'esh-03-ui-hover-versions-attachments',
+      tree_id: 'eventline-session-history',
       icon: '🧩✨',
       title: '补齐 hover card、版本与附件',
       detail: 'UI 分支加入 hover card、节点版本记录、attachments 展示，让节点能承载更完整的上下文。',
       after: 'esh-02-ui-dag-baseline',
-      edgeLabel: 'ui iteration',
+      edge_label: 'ui iteration',
       attachments: [{ type: 'file', label: 'eventline UI implementation', uri: 'src/App.tsx' }],
     },
   },
@@ -458,13 +487,13 @@ const sampleScript: EventlineToolCall[] = [
     from: 'frontend-agent',
     at: '2026-05-24T08:55:34.486Z',
     arguments: {
-      id: 'esh-04-playback-jsonl-access-view',
-      treeId: 'eventline-session-history',
+      node_id: 'esh-04-playback-jsonl-access-view',
+      tree_id: 'eventline-session-history',
       icon: '▶️',
       title: '加入播放、JSONL 持久化与 access 文本视图',
       detail: '主线继续扩展为可回放、可持久化的事件图，并提供 eventline.access 的 agent-readable 文本视图。',
       after: 'esh-03-ui-hover-versions-attachments',
-      edgeLabel: 'state view',
+      edge_label: 'state view',
     },
   },
   {
@@ -472,13 +501,13 @@ const sampleScript: EventlineToolCall[] = [
     from: 'tooling-agent',
     at: '2026-05-24T08:55:43.013Z',
     arguments: {
-      id: 'esh-05-mcp-server-real-tools',
-      treeId: 'eventline-session-history',
+      node_id: 'esh-05-mcp-server-real-tools',
+      tree_id: 'eventline-session-history',
       icon: '🔧',
       title: '实现 MCP server 真实工具',
       detail: 'MCP 分支把 eventline 从前端原型推进为真实 server 工具，支持 create_tree、upsert_node、connect_events、delete 与 access。',
       after: 'esh-04-playback-jsonl-access-view',
-      edgeLabel: 'tooling',
+      edge_label: 'tooling',
     },
   },
   {
@@ -486,13 +515,13 @@ const sampleScript: EventlineToolCall[] = [
     from: 'tooling-agent',
     at: '2026-05-24T08:55:52.152Z',
     arguments: {
-      id: 'esh-06-codex-headless-agent-test',
-      treeId: 'eventline-session-history',
+      node_id: 'esh-06-codex-headless-agent-test',
+      tree_id: 'eventline-session-history',
       icon: '🤖',
       title: '用 Codex headless 验证 agent 工具链',
       detail: '通过 Codex headless 模式测试 agent 是否能创建 tree、node、edge，执行 delete，并读取 access 状态。',
       after: 'esh-05-mcp-server-real-tools',
-      edgeLabel: 'validate',
+      edge_label: 'validate',
     },
   },
   {
@@ -500,13 +529,13 @@ const sampleScript: EventlineToolCall[] = [
     from: 'schema-agent',
     at: '2026-05-24T08:55:59.705Z',
     arguments: {
-      id: 'esh-07-web-ui-auto-schema',
-      treeId: 'eventline-session-history',
+      node_id: 'esh-07-web-ui-auto-schema',
+      tree_id: 'eventline-session-history',
       icon: '📐',
       title: 'Web UI Tool Schema 改为读取 MCP schema',
       detail: 'Web UI 的 Tool Schema 面板从手写说明改为自动读取 MCP schema，减少重复维护并贴近真实工具定义。',
       after: 'esh-06-codex-headless-agent-test',
-      edgeLabel: 'schema sync',
+      edge_label: 'schema sync',
     },
   },
   {
@@ -514,13 +543,13 @@ const sampleScript: EventlineToolCall[] = [
     from: 'frontend-agent',
     at: '2026-05-24T08:56:07.493Z',
     arguments: {
-      id: 'esh-08-tree-filter-multiselect-highlight',
-      treeId: 'eventline-session-history',
+      node_id: 'esh-08-tree-filter-multiselect-highlight',
+      tree_id: 'eventline-session-history',
       icon: '🔎',
       title: '加入 tree 过滤与多选高亮',
       detail: 'UI/交互分支新增 tree 过滤和多选高亮，使多棵事件树能在同一画布中被筛选、对比和定位。',
       after: 'esh-07-web-ui-auto-schema',
-      edgeLabel: 'ui refinement',
+      edge_label: 'ui refinement',
     },
   },
   {
@@ -528,13 +557,13 @@ const sampleScript: EventlineToolCall[] = [
     from: 'frontend-agent',
     at: '2026-05-24T08:56:15.317Z',
     arguments: {
-      id: 'esh-09-fix-access-dialog-tree-defaults',
-      treeId: 'eventline-session-history',
+      node_id: 'esh-09-fix-access-dialog-tree-defaults',
+      tree_id: 'eventline-session-history',
       icon: '🛠️',
       title: '修复默认 access 弹窗与 tree 默认可见状态',
       detail: '修正默认 access 弹窗行为和 tree 初始可见状态，避免打开页面时误导用户或隐藏关键事件线。',
       after: 'esh-08-tree-filter-multiselect-highlight',
-      edgeLabel: 'fix',
+      edge_label: 'fix',
     },
   },
   {
@@ -542,13 +571,13 @@ const sampleScript: EventlineToolCall[] = [
     from: 'doc-agent',
     at: '2026-05-24T08:56:23.306Z',
     arguments: {
-      id: 'esh-10-readme-created',
-      treeId: 'eventline-session-history',
+      node_id: 'esh-10-readme-created',
+      tree_id: 'eventline-session-history',
       icon: '📘',
       title: '创建 README 说明文档',
       detail: '文档分支整理 eventline 原型的目标、运行方式、MCP 工具能力和交互说明，形成 README。',
       after: 'esh-09-fix-access-dialog-tree-defaults',
-      edgeLabel: 'document',
+      edge_label: 'document',
       attachments: [{ type: 'file', label: 'README', uri: 'README.md' }],
     },
   },
@@ -557,13 +586,13 @@ const sampleScript: EventlineToolCall[] = [
     from: 'doc-agent',
     at: '2026-05-24T08:56:31.766Z',
     arguments: {
-      id: 'esh-11-readme-screenshot-top',
-      treeId: 'eventline-session-history',
+      node_id: 'esh-11-readme-screenshot-top',
+      tree_id: 'eventline-session-history',
       icon: '🖼️📘',
       title: '把截图放入 README 顶部',
       detail: '将 eventline UI 截图放到 README 顶部，方便读者先看到最终视觉效果再阅读工具说明。',
       after: 'esh-10-readme-created',
-      edgeLabel: 'illustrate',
+      edge_label: 'illustrate',
       attachments: [{ type: 'image', label: 'eventline UI screenshot', uri: 'image.png' }],
     },
   },
@@ -572,7 +601,7 @@ const sampleScript: EventlineToolCall[] = [
     from: 'writing-agent',
     at: '2026-05-24T08:56:38.514Z',
     arguments: {
-      treeId: 'academic-writing-process',
+      tree_id: 'academic-writing-process',
       title: '学术写作过程虚构线',
     },
   },
@@ -581,8 +610,8 @@ const sampleScript: EventlineToolCall[] = [
     from: 'writing-agent',
     at: '2026-05-24T08:56:45.656Z',
     arguments: {
-      id: 'awp-01-topic-selected',
-      treeId: 'academic-writing-process',
+      node_id: 'awp-01-topic-selected',
+      tree_id: 'academic-writing-process',
       icon: '💡',
       title: '确定论文主题',
       detail: '研究者确定论文主题：用 agent-readable event graph 支持复杂项目写作与工程过程追踪。',
@@ -593,13 +622,13 @@ const sampleScript: EventlineToolCall[] = [
     from: 'writing-agent',
     at: '2026-05-24T08:56:54.435Z',
     arguments: {
-      id: 'awp-02-related-work-mapped',
-      treeId: 'academic-writing-process',
+      node_id: 'awp-02-related-work-mapped',
+      tree_id: 'academic-writing-process',
       icon: '📚',
       title: '整理 related work',
       detail: '作者梳理 event sourcing、provenance graph、multi-agent collaboration 和 research workflow tooling 四类相关工作。',
       after: 'awp-01-topic-selected',
-      edgeLabel: 'survey',
+      edge_label: 'survey',
       attachments: [{ type: 'file', label: 'related work notes', uri: 'notes/related-work.md' }],
     },
   },
@@ -608,13 +637,13 @@ const sampleScript: EventlineToolCall[] = [
     from: 'writing-agent',
     at: '2026-05-24T08:57:01.882Z',
     arguments: {
-      id: 'awp-03-problem-statement',
-      treeId: 'academic-writing-process',
+      node_id: 'awp-03-problem-statement',
+      tree_id: 'academic-writing-process',
       icon: '❓',
       title: '形成 problem statement',
       detail: '论文把问题收敛为：现有协作工具缺少可回放、可审计、可被 agent 直接读取的项目级事件状态。',
       after: 'awp-02-related-work-mapped',
-      edgeLabel: 'synthesize',
+      edge_label: 'synthesize',
     },
   },
   {
@@ -622,13 +651,13 @@ const sampleScript: EventlineToolCall[] = [
     from: 'writing-agent',
     at: '2026-05-24T08:57:10.010Z',
     arguments: {
-      id: 'awp-04-method-framework',
-      treeId: 'academic-writing-process',
+      node_id: 'awp-04-method-framework',
+      tree_id: 'academic-writing-process',
       icon: '🧱✨',
       title: '设计方法框架',
       detail: '方法框架采用事件树、版本化节点、显式边、附件和 access 文本视图，把可视化与 agent 状态读取统一起来。',
       after: 'awp-03-problem-statement',
-      edgeLabel: 'design',
+      edge_label: 'design',
     },
   },
   {
@@ -636,13 +665,13 @@ const sampleScript: EventlineToolCall[] = [
     from: 'writing-agent',
     at: '2026-05-24T08:57:18.792Z',
     arguments: {
-      id: 'awp-05-experiment-plan',
-      treeId: 'academic-writing-process',
+      node_id: 'awp-05-experiment-plan',
+      tree_id: 'academic-writing-process',
       icon: '🧪',
       title: '写出实验计划',
       detail: '实验计划覆盖 UI 可读性、agent 工具调用成功率、删除后继保留、跨 tree 引用和长会话可恢复性。',
       after: 'awp-04-method-framework',
-      edgeLabel: 'evaluate',
+      edge_label: 'evaluate',
     },
   },
   {
@@ -650,13 +679,13 @@ const sampleScript: EventlineToolCall[] = [
     from: 'review-agent',
     at: '2026-05-24T08:58:11.272Z',
     arguments: {
-      id: 'awp-06-feedback-plan-too-broad',
-      treeId: 'academic-writing-process',
+      node_id: 'awp-06-feedback-plan-too-broad',
+      tree_id: 'academic-writing-process',
       icon: '💬',
       title: '收到反馈：实验计划过宽',
       detail: '内部反馈指出实验计划同时覆盖 UI、agent、持久化和恢复性，评估范围偏宽，需要优先定义核心证据。',
       after: 'awp-05-experiment-plan',
-      edgeLabel: 'feedback',
+      edge_label: 'feedback',
     },
   },
   {
@@ -664,8 +693,8 @@ const sampleScript: EventlineToolCall[] = [
     from: 'writing-agent',
     at: '2026-05-24T08:58:19.585Z',
     arguments: {
-      id: 'awp-05-experiment-plan',
-      treeId: 'academic-writing-process',
+      node_id: 'awp-05-experiment-plan',
+      tree_id: 'academic-writing-process',
       icon: '🧪',
       title: '写出实验计划',
       detail: '实验计划经反馈后收敛为三项核心验证：agent 工具调用完整性、删除后继保留语义、access 文本视图对 checklist 的可用性。',
@@ -677,13 +706,13 @@ const sampleScript: EventlineToolCall[] = [
     from: 'experiment-agent',
     at: '2026-05-24T08:58:29.087Z',
     arguments: {
-      id: 'awp-07-experiment-results-added',
-      treeId: 'academic-writing-process',
+      node_id: 'awp-07-experiment-results-added',
+      tree_id: 'academic-writing-process',
       icon: '📊',
       title: '补充实验结果',
       detail: '作者补充结果：agent 能稳定构造事件树，删除错误节点不会级联删除后继，access 视图适合生成提交前状态摘要。',
       after: 'awp-06-feedback-plan-too-broad',
-      edgeLabel: 'add evidence',
+      edge_label: 'add evidence',
       attachments: [{ type: 'image', label: 'result chart', uri: '/sample-evidence.svg' }],
     },
   },
@@ -692,13 +721,13 @@ const sampleScript: EventlineToolCall[] = [
     from: 'review-agent',
     at: '2026-05-24T08:58:36.291Z',
     arguments: {
-      id: 'awp-08-overclaim-error',
-      treeId: 'academic-writing-process',
+      node_id: 'awp-08-overclaim-error',
+      tree_id: 'academic-writing-process',
       icon: '⚠️',
       title: '错误事件：早期 claim 过强',
       detail: '作者曾写下过强 claim：系统完全解决所有 multi-agent 项目协作可解释性问题。该说法超出证据范围，需要删除。',
       after: 'awp-07-experiment-results-added',
-      edgeLabel: 'overclaim',
+      edge_label: 'overclaim',
     },
   },
   {
@@ -706,13 +735,13 @@ const sampleScript: EventlineToolCall[] = [
     from: 'writing-agent',
     at: '2026-05-24T08:58:43.669Z',
     arguments: {
-      id: 'awp-09-revision-note-after-overclaim',
-      treeId: 'academic-writing-process',
+      node_id: 'awp-09-revision-note-after-overclaim',
+      tree_id: 'academic-writing-process',
       icon: '✍️',
       title: '保留 revision note：收敛 claim 范围',
       detail: '后继修订说明保留：将 claim 改为系统提供可审计的事件状态表示，并在特定 agent workflow 中验证其可用性。',
       after: 'awp-08-overclaim-error',
-      edgeLabel: 'revise',
+      edge_label: 'revise',
     },
   },
   {
@@ -720,7 +749,7 @@ const sampleScript: EventlineToolCall[] = [
     from: 'review-agent',
     at: '2026-05-24T08:58:53.082Z',
     arguments: {
-      nodeId: 'awp-08-overclaim-error',
+      node_node_id: 'awp-08-overclaim-error',
       reason: '测试删除错误事件本身，并确认后继 revision note 节点仍保留。',
     },
   },
@@ -729,13 +758,13 @@ const sampleScript: EventlineToolCall[] = [
     from: 'writing-agent',
     at: '2026-05-24T08:58:59.369Z',
     arguments: {
-      id: 'awp-10-introduction-rewritten',
-      treeId: 'academic-writing-process',
+      node_id: 'awp-10-introduction-rewritten',
+      tree_id: 'academic-writing-process',
       icon: '📝',
       title: '重写 introduction',
       detail: '作者根据修订说明重写 introduction，弱化万能化表述，突出 project-level event state 对 agent 协作的具体价值。',
       after: 'awp-09-revision-note-after-overclaim',
-      edgeLabel: 'rewrite',
+      edge_label: 'rewrite',
     },
   },
   {
@@ -743,13 +772,13 @@ const sampleScript: EventlineToolCall[] = [
     from: 'writing-agent',
     at: '2026-05-24T08:59:10.036Z',
     arguments: {
-      id: 'awp-11-limitation-added',
-      treeId: 'academic-writing-process',
+      node_id: 'awp-11-limitation-added',
+      tree_id: 'academic-writing-process',
       icon: '🚧',
       title: '补充 limitation',
       detail: '论文新增 limitation：当前验证集中在小规模 agent 写作/工程任务，对大规模长期项目和生产环境协作仍需更多评估。',
       after: 'awp-10-introduction-rewritten',
-      edgeLabel: 'qualify',
+      edge_label: 'qualify',
     },
   },
   {
@@ -757,13 +786,13 @@ const sampleScript: EventlineToolCall[] = [
     from: 'writing-agent',
     at: '2026-05-24T08:59:24.707Z',
     arguments: {
-      id: 'awp-12-rebuttal-draft',
-      treeId: 'academic-writing-process',
+      node_id: 'awp-12-rebuttal-draft',
+      tree_id: 'academic-writing-process',
       icon: '🧾',
       title: '完成 rebuttal draft',
       detail: 'rebuttal draft 回应审稿人对 novelty、evidence scope 和 agent-readable 状态可复现性的质疑，并引用修订后的实验结果。',
       after: 'awp-11-limitation-added',
-      edgeLabel: 'respond',
+      edge_label: 'respond',
     },
   },
   {
@@ -771,13 +800,13 @@ const sampleScript: EventlineToolCall[] = [
     from: 'writing-agent',
     at: '2026-05-24T08:59:34.492Z',
     arguments: {
-      id: 'awp-13-submission-checklist',
-      treeId: 'academic-writing-process',
+      node_id: 'awp-13-submission-checklist',
+      tree_id: 'academic-writing-process',
       icon: '✅📋',
       title: '准备 submission checklist',
       detail: '作者准备提交清单：核对 claims 与证据一致性、related work 覆盖、实验 artifact、limitations、rebuttal 口径和 agent-readable 状态摘要。',
       after: 'awp-12-rebuttal-draft',
-      edgeLabel: 'finalize',
+      edge_label: 'finalize',
     },
   },
   {
@@ -787,7 +816,7 @@ const sampleScript: EventlineToolCall[] = [
     arguments: {
       source: 'esh-04-playback-jsonl-access-view',
       target: 'awp-13-submission-checklist',
-      treeId: 'eventline-session-history',
+      tree_id: 'eventline-session-history',
       label: 'agent-readable state',
     },
   },
@@ -969,6 +998,17 @@ function displayDate(value: string): string {
     hour: '2-digit',
     minute: '2-digit',
   }).format(date);
+}
+
+function displayUpdateDate(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  const year = date.getFullYear();
+  const month = `${date.getMonth() + 1}`.padStart(2, '0');
+  const day = `${date.getDate()}`.padStart(2, '0');
+  return `${year}/${month}/${day}`;
 }
 
 function emojiIconsFor(icon?: string): string[] {
@@ -1280,19 +1320,19 @@ function applyToolCallToGraph(baseGraph: EventlineGraph, call: EventlineReplayCa
   }
 
   if (call.tool === 'eventline.create_tree') {
-    const treeId = readAlias(args, ['treeId', 'tree_id'], 'main');
+    const treeId = readAlias(args, ['tree_id', 'treeId'], 'main');
     const title = normalizeString(args.title, treeId);
     graph = ensureTree(graph, treeId, from, at, title);
     return { graph, changedNodeIds: [] };
   }
 
   if (call.tool === 'eventline.upsert_node') {
-    const id = readAlias(args, ['id', 'node_id', 'nodeId']);
+    const id = readAlias(args, ['node_id', 'id', 'nodeId']);
     if (!id) {
-      return { graph, changedNodeIds: [], notice: 'eventline.upsert_node requires arguments.id' };
+      return { graph, changedNodeIds: [], notice: 'eventline.upsert_node requires arguments.node_id' };
     }
     const existing = graph.nodes[id];
-    const treeId = readAlias(args, ['treeId', 'tree_id'], existing?.treeId || 'main');
+    const treeId = readAlias(args, ['tree_id', 'treeId'], existing?.treeId || 'main');
     const after = normalizeAfter(args.after);
     graph = ensureTree(graph, treeId, from, at);
 
@@ -1306,7 +1346,7 @@ function applyToolCallToGraph(baseGraph: EventlineGraph, call: EventlineReplayCa
     const attachments = normalizeAttachments(args.attachments ?? args.refs, existing?.attachments || []);
     const versionId = normalizeString(
       args.versionId,
-      versionIdFor({ id, treeId, title, detail, icon, attachments, at, from }),
+      versionIdFor({ node_id: id, treeId: treeId, title, detail, icon, attachments, at, from_agent: from }),
     );
     const version: EventVersion = {
       versionId,
@@ -1332,7 +1372,7 @@ function applyToolCallToGraph(baseGraph: EventlineGraph, call: EventlineReplayCa
       },
     };
 
-    const edgeLabel = readAlias(args, ['edgeLabel', 'edge_label']);
+    const edgeLabel = readAlias(args, ['edge_label', 'edgeLabel']);
     for (const source of after) {
       graph = addEdgeIfNeeded(graph, source, id, treeId, edgeLabel, from, at);
     }
@@ -1347,7 +1387,7 @@ function applyToolCallToGraph(baseGraph: EventlineGraph, call: EventlineReplayCa
     if (!source || !target) {
       return { graph, changedNodeIds: [], notice: 'eventline.connect_events requires source and target' };
     }
-    const treeId = readAlias(args, ['treeId', 'tree_id'], graph.nodes[target]?.treeId || graph.nodes[source]?.treeId || 'main');
+    const treeId = readAlias(args, ['tree_id', 'treeId'], graph.nodes[target]?.treeId || graph.nodes[source]?.treeId || 'main');
     const label = normalizeString(args.label, '');
     const edgeId = readAlias(args, ['id', 'edge_id', 'edgeId']);
     graph = ensureTree(graph, treeId, from, at);
@@ -1357,10 +1397,10 @@ function applyToolCallToGraph(baseGraph: EventlineGraph, call: EventlineReplayCa
   }
 
   if (call.tool === 'eventline.delete') {
-    const nodeId = readAlias(args, ['nodeId', 'node_id', 'id']);
-    const edgeId = readAlias(args, ['edgeId', 'edge_id']);
+    const nodeId = readAlias(args, ['node_id', 'nodeId', 'id']);
+    const edgeId = readAlias(args, ['edge_id', 'edgeId']);
     if (nodeId && edgeId) {
-      return { graph, changedNodeIds: [], notice: 'eventline.delete accepts either nodeId or edgeId, not both' };
+      return { graph, changedNodeIds: [], notice: 'eventline.delete accepts either node_id or edge_id, not both' };
     }
     if (nodeId) {
       const result = deleteNodeProjection(graph, nodeId);
@@ -1378,7 +1418,7 @@ function applyToolCallToGraph(baseGraph: EventlineGraph, call: EventlineReplayCa
         notice: existed ? undefined : `eventline.delete edge not found: ${edgeId}`,
       };
     }
-    return { graph, changedNodeIds: [], notice: 'eventline.delete requires nodeId or edgeId' };
+    return { graph, changedNodeIds: [], notice: 'eventline.delete requires node_id or edge_id' };
   }
 
   if (call.tool === 'eventline.move_node') {
@@ -1406,11 +1446,22 @@ function parseToolCalls(raw: string): EventlineToolCall[] {
       throw new Error(`Unsupported tool: ${String(record.tool)}`);
     }
     const args = record.arguments;
+    const normalizedArgs = args && typeof args === 'object' ? (args as Record<string, unknown>) : {};
+    if (tool === 'eventline.upsert_node') {
+      const allowedKeys = new Set(['node_id', 'tree_id', 'title', 'detail', 'icon', 'after', 'edge_label', 'attachments']);
+      const extraKeys = Object.keys(normalizedArgs).filter((key) => !allowedKeys.has(key));
+      if (extraKeys.length > 0) {
+        throw new Error(`eventline.upsert_node only accepts flat snake_case arguments; invalid keys: ${extraKeys.join(', ')}`);
+      }
+      if (!normalizeString(normalizedArgs.node_id)) {
+        throw new Error('eventline.upsert_node requires arguments.node_id.');
+      }
+    }
     return {
       tool,
-      from: normalizeString(record.from, 'manual_agent'),
+      from: normalizeString(record.from_agent, normalizeString(record.from, 'manual_agent')),
       at: normalizeString(record.at) || undefined,
-      arguments: args && typeof args === 'object' ? (args as Record<string, unknown>) : {},
+      arguments: normalizedArgs,
     };
   });
 }
@@ -1468,7 +1519,7 @@ function parseAccessToolCall(raw: string): EventlineAccessArgs {
 function jsonlEventToToolCall(event: EventlineJsonlEvent): EventlineReplayCall {
   return {
     tool: event.tool,
-    from: event.from,
+    from: event.from_agent,
     at: event.at,
     arguments: event.arguments,
   };
@@ -1479,7 +1530,7 @@ function toolCallToJsonlEvent(call: EventlineToolCall, seq: number): EventlineJs
     seq,
     project_id: EVENTLINE_PROJECT_ID,
     at: call.at || new Date().toISOString(),
-    from: normalizeString(call.from, 'unknown_agent'),
+    from_agent: normalizeString(call.from, 'unknown_agent'),
     tool: call.tool,
     arguments: call.arguments || {},
   };
@@ -1505,7 +1556,7 @@ function parseJsonlEvents(jsonl: string): EventlineJsonlEvent[] {
         seq: Number.isFinite(Number(record.seq)) ? Number(record.seq) : index + 1,
         project_id: normalizeString(record.project_id, EVENTLINE_PROJECT_ID),
         at: normalizeString(record.at) || new Date().toISOString(),
-        from: normalizeString(record.from, 'unknown_agent'),
+        from_agent: normalizeString(record.from_agent, normalizeString(record.from, 'unknown_agent')),
         tool,
         arguments: args && typeof args === 'object' ? (args as Record<string, unknown>) : {},
       };
@@ -1579,6 +1630,411 @@ async function writeEventFile(jsonl: string): Promise<void> {
   }
 }
 
+function isBackendImageExportMode(): boolean {
+  const params = new URLSearchParams(window.location.search);
+  return params.get(BACKEND_EXPORT_PARAM) === BACKEND_EXPORT_MODE;
+}
+
+function backendExportTheme(): EventlineTheme {
+  const value = new URLSearchParams(window.location.search).get('theme')?.toUpperCase();
+  return value === 'LIGHT' || value === 'DARK' || value === 'HACKER' ? value : 'LIGHT';
+}
+
+function idsParam(name: string): string[] {
+  const raw = new URLSearchParams(window.location.search).get(name);
+  return raw ? raw.split(',').map((item) => item.trim()).filter(Boolean) : [];
+}
+
+function imageExportFileName(prefix = 'eventline'): string {
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  return `${prefix}-${stamp}.png`;
+}
+
+function downloadDataUrl(dataUrl: string, filename: string): void {
+  const link = document.createElement('a');
+  link.href = dataUrl;
+  link.download = filename;
+  link.rel = 'noopener';
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+}
+
+const SCREENSHOT_TARGET_BYTES = 2 * 1024 * 1024;
+const SCREENSHOT_TARGET_LOW_BYTES = Math.round(SCREENSHOT_TARGET_BYTES * 0.82);
+const SCREENSHOT_TARGET_HIGH_BYTES = Math.round(SCREENSHOT_TARGET_BYTES * 1.18);
+const SCREENSHOT_MIN_SCALE = 4;
+const SCREENSHOT_MAX_SCALE = 16;
+const SCREENSHOT_MAX_PIXELS = 64_000_000;
+
+function pngDataUrlByteSize(dataUrl: string): number {
+  const commaIndex = dataUrl.indexOf(',');
+  const base64 = commaIndex >= 0 ? dataUrl.slice(commaIndex + 1) : dataUrl;
+  const padding = base64.endsWith('==') ? 2 : base64.endsWith('=') ? 1 : 0;
+  return Math.max(0, Math.floor((base64.length * 3) / 4) - padding);
+}
+
+function scaleSvgForPng(svg: string, width: number, height: number, scale: number): string {
+  const scaledWidth = Math.max(1, Math.ceil(width * scale));
+  const scaledHeight = Math.max(1, Math.ceil(height * scale));
+  return svg.replace(
+    /(<svg\b[^>]*?)\swidth="[^"]+"\sheight="[^"]+"/,
+    `$1 width="${scaledWidth}" height="${scaledHeight}"`,
+  );
+}
+
+function escapeSvgText(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function themeCssVariables(theme: EventlineTheme): Record<string, string> {
+  if (theme === 'LIGHT') {
+    return {
+      bg: '#f8fafc',
+      surface: '#ffffff',
+      text: '#172033',
+      red: '#e11d48',
+      purple: '#7c3aed',
+      blue: '#2563eb',
+      gridA: 'rgba(37, 99, 235, 0.12)',
+      gridB: 'rgba(124, 58, 237, 0.08)',
+      edgeBase: 'rgba(37, 99, 235, 0.17)',
+      edgeGlowBlue: 'rgba(37, 99, 235, 0.18)',
+      edgeGlowRed: 'rgba(225, 29, 72, 0.12)',
+      nodeShadowBlue: 'rgba(37, 99, 235, 0.18)',
+      nodeShadowRed: 'rgba(225, 29, 72, 0.16)',
+      nodeShadowPurple: 'rgba(124, 58, 237, 0.12)',
+      iconGlowBlue: 'rgba(37, 99, 235, 0.34)',
+    };
+  }
+  if (theme === 'HACKER') {
+    return {
+      bg: '#061009',
+      surface: '#07140b',
+      text: '#eafff1',
+      red: '#84cc16',
+      purple: '#22c55e',
+      blue: '#14b8a6',
+      gridA: 'rgba(34, 197, 94, 0.16)',
+      gridB: 'rgba(20, 184, 166, 0.08)',
+      edgeBase: 'rgba(34, 197, 94, 0.2)',
+      edgeGlowBlue: 'rgba(20, 184, 166, 0.38)',
+      edgeGlowRed: 'rgba(132, 204, 22, 0.24)',
+      nodeShadowBlue: 'rgba(20, 184, 166, 0.26)',
+      nodeShadowRed: 'rgba(132, 204, 22, 0.26)',
+      nodeShadowPurple: 'rgba(34, 197, 94, 0.18)',
+      iconGlowBlue: 'rgba(20, 184, 166, 0.34)',
+    };
+  }
+  return {
+    bg: '#121212',
+    surface: '#15151a',
+    text: '#f7f7f2',
+    red: '#f43f5e',
+    purple: '#8b5cf6',
+    blue: '#38bdf8',
+    gridA: 'rgba(129, 140, 248, 0.14)',
+    gridB: 'rgba(56, 189, 248, 0.06)',
+    edgeBase: 'rgba(129, 140, 248, 0.2)',
+    edgeGlowBlue: 'rgba(56, 189, 248, 0.34)',
+    edgeGlowRed: 'rgba(244, 63, 94, 0.18)',
+    nodeShadowBlue: 'rgba(56, 189, 248, 0.24)',
+    nodeShadowRed: 'rgba(244, 63, 94, 0.24)',
+    nodeShadowPurple: 'rgba(139, 92, 246, 0.16)',
+    iconGlowBlue: 'rgba(56, 189, 248, 0.34)',
+  };
+}
+
+function screenshotIconGlyph(iconName: string): string {
+  const glyphByIcon: Record<string, string> = {
+    alert: '!',
+    binary: '01',
+    branch: '◇',
+    bug: '×',
+    check: '✓',
+    clock: '◷',
+    default: '✦',
+    file: '□',
+    flag: '⚑',
+    image: '▣',
+    network: '⌘',
+    search: '⌕',
+    shield: '◈',
+    verified: '✓',
+    workflow: '⌁',
+  };
+  return glyphByIcon[iconName] || glyphByIcon.default;
+}
+
+function renderScreenshotNode(node: EventFlowNode, viewportX: number, viewportY: number): string {
+  const data = node.data;
+  const x = node.position.x - viewportX;
+  const y = node.position.y - viewportY;
+  const cx = x + NODE_WIDTH / 2;
+  const cy = y + NODE_HEIGHT / 2;
+  const emojis = emojiIconsFor(data.icon);
+  const highlight = data.isTreeHighlighted
+    ? `<g opacity="0.85">
+        <circle cx="${cx}" cy="${cy}" r="42" fill="none" stroke="${data.treeHighlightColor}" stroke-width="2" opacity="0.74" />
+        <circle cx="${cx}" cy="${cy}" r="42" fill="none" stroke="${data.treeHighlightColor}" stroke-width="9" opacity="0.16" />
+        <circle cx="${cx}" cy="${cy}" r="42" fill="none" stroke="${data.treeHighlightColor}" stroke-width="17" opacity="0.08" />
+      </g>`
+    : '';
+  const iconContent = emojis.length > 0
+    ? emojis.map((emoji, index) => {
+        const emojiX = emojis.length === 1 ? cx : cx + (index === 0 ? -9 : 9);
+        return `<text x="${emojiX}" y="${cy + 10}" text-anchor="middle" font-size="${emojis.length === 1 ? 31 : 25}" font-family="Apple Color Emoji, Segoe UI Emoji, sans-serif">${escapeSvgText(emoji)}</text>`;
+      }).join('')
+    : `<text x="${cx}" y="${cy + 8}" text-anchor="middle" font-size="22" font-weight="800" fill="var(--surface)" font-family="Inter, ui-sans-serif, system-ui, sans-serif">${escapeSvgText(screenshotIconGlyph(data.icon || 'default'))}</text>`;
+  return `
+    ${highlight}
+    <circle cx="${cx}" cy="${cy}" r="29" fill="var(--surface)" filter="url(#nodeOuterGlow)" />
+    <circle cx="${cx}" cy="${cy}" r="29" fill="url(#nodeRing)" />
+    <circle cx="${cx}" cy="${cy}" r="27" fill="var(--surface)" />
+    <circle cx="${cx}" cy="${cy}" r="21" fill="url(#iconBg)" filter="url(#iconGlow)" />
+    ${iconContent}
+  `;
+}
+
+function renderScreenshotEdge(edge: EventFlowEdge, nodeById: Map<string, EventFlowNode>, viewportX: number, viewportY: number): string {
+  const source = nodeById.get(edge.source);
+  const target = nodeById.get(edge.target);
+  if (!source || !target || !edge.data) {
+    return '';
+  }
+  const sourceCenter = { x: source.position.x + NODE_WIDTH / 2, y: source.position.y + NODE_HEIGHT / 2 };
+  const targetCenter = { x: target.position.x + NODE_WIDTH / 2, y: target.position.y + NODE_HEIGHT / 2 };
+  let sourceX = sourceCenter.x + NODE_WIDTH / 2;
+  let sourceY = sourceCenter.y;
+  let targetX = targetCenter.x - NODE_WIDTH / 2;
+  let targetY = targetCenter.y;
+  if (edge.data.routeMode === 'vertical') {
+    const downward = targetCenter.y >= sourceCenter.y;
+    sourceX = sourceCenter.x;
+    sourceY = sourceCenter.y + (downward ? NODE_HEIGHT / 2 : -NODE_HEIGHT / 2);
+    targetX = targetCenter.x;
+    targetY = targetCenter.y + (downward ? -NODE_HEIGHT / 2 : NODE_HEIGHT / 2);
+  } else if (targetCenter.x < sourceCenter.x) {
+    sourceX = sourceCenter.x - NODE_WIDTH / 2;
+    targetX = targetCenter.x + NODE_WIDTH / 2;
+  }
+  const path = edge.data.routeMode === 'vertical'
+    ? buildVerticalEdgePath(
+        sourceX - viewportX,
+        sourceY - viewportY,
+        targetX - viewportX,
+        targetY - viewportY,
+        edge.data.routeX - viewportX,
+        edge.data.bridgeYs.map((bridgeY) => bridgeY - viewportY),
+        edge.data.bridgeDirection,
+      )
+    : buildHorizontalEdgePath(sourceX - viewportX, sourceY - viewportY, targetX - viewportX, targetY - viewportY);
+  const labelX = (edge.data.routeMode === 'vertical' ? edge.data.routeX : (sourceX + targetX) / 2) - viewportX;
+  const labelY = ((sourceY + targetY) / 2) - viewportY;
+  const label = edge.data.label
+    ? `<g transform="translate(${labelX} ${labelY})">
+        <rect x="-58" y="-13" width="116" height="26" rx="13" fill="var(--surface)" stroke="rgba(129,140,248,0.42)" />
+        <text x="0" y="4" text-anchor="middle" font-size="11" fill="var(--text)" font-family="Inter, system-ui, sans-serif">${escapeSvgText(edge.data.label)}</text>
+      </g>`
+    : '';
+  return `
+    <path d="${path}" fill="none" stroke="var(--edge-base)" stroke-width="7" stroke-linecap="round" marker-end="url(#arrow)" />
+    <path d="${path}" fill="none" stroke="url(#edgeGradient)" stroke-width="2.5" stroke-linecap="round" stroke-dasharray="8 8" filter="url(#edgeGlow)" opacity="0.9" />
+    <path d="${path}" fill="none" stroke="url(#edgeGradient)" stroke-width="2.5" stroke-linecap="round" stroke-dasharray="8 8" marker-end="url(#arrow)" />
+    ${label}
+  `;
+}
+
+function renderPngDataUrlAtScale(svg: string, width: number, height: number, scale: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    const scaledWidth = Math.max(1, Math.ceil(width * scale));
+    const scaledHeight = Math.max(1, Math.ceil(height * scale));
+    const scaledSvg = scaleSvgForPng(svg, width, height, scale);
+    const url = URL.createObjectURL(new Blob([scaledSvg], { type: 'image/svg+xml;charset=utf-8' }));
+    image.onload = () => {
+      URL.revokeObjectURL(url);
+      const canvas = document.createElement('canvas');
+      canvas.width = scaledWidth;
+      canvas.height = scaledHeight;
+      const context = canvas.getContext('2d');
+      if (!context) {
+        reject(new Error('Browser canvas is not available.'));
+        return;
+      }
+      context.imageSmoothingEnabled = true;
+      context.imageSmoothingQuality = 'high';
+      context.drawImage(image, 0, 0, scaledWidth, scaledHeight);
+      resolve(canvas.toDataURL('image/png'));
+    };
+    image.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error('Failed to render current eventline SVG.'));
+    };
+    image.src = url;
+  });
+}
+
+async function browserPngFromSvg(svg: string, width: number, height: number): Promise<string> {
+  const maxScaleByPixels = Math.sqrt(SCREENSHOT_MAX_PIXELS / Math.max(1, width * height));
+  const maxScale = Math.max(1, Math.min(SCREENSHOT_MAX_SCALE, maxScaleByPixels));
+  const startScale = Math.min(maxScale, Math.max(SCREENSHOT_MIN_SCALE, window.devicePixelRatio || 2));
+
+  let low: { scale: number; dataUrl: string; bytes: number } | null = null;
+  let high: { scale: number; dataUrl: string; bytes: number } | null = null;
+  let currentScale = startScale;
+
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const dataUrl = await renderPngDataUrlAtScale(svg, width, height, currentScale);
+    const bytes = pngDataUrlByteSize(dataUrl);
+    const current = { scale: currentScale, dataUrl, bytes };
+
+    if (bytes >= SCREENSHOT_TARGET_LOW_BYTES && bytes <= SCREENSHOT_TARGET_HIGH_BYTES) {
+      return dataUrl;
+    }
+    if (bytes < SCREENSHOT_TARGET_LOW_BYTES) {
+      low = current;
+      if (currentScale >= maxScale) {
+        return dataUrl;
+      }
+      const ratioScale = Math.sqrt(SCREENSHOT_TARGET_BYTES / Math.max(bytes, 1));
+      currentScale = Math.min(maxScale, Math.max(currentScale + 1, currentScale * ratioScale));
+      continue;
+    }
+
+    high = current;
+    if (!low) {
+      currentScale = Math.max(1, currentScale * Math.sqrt(SCREENSHOT_TARGET_BYTES / bytes));
+      if (Math.abs(currentScale - current.scale) < 0.25) {
+        return dataUrl;
+      }
+      continue;
+    }
+
+    currentScale = (low.scale + high.scale) / 2;
+    if (Math.abs(high.scale - low.scale) < 0.35) {
+      return Math.abs(low.bytes - SCREENSHOT_TARGET_BYTES) < Math.abs(high.bytes - SCREENSHOT_TARGET_BYTES)
+        ? low.dataUrl
+        : high.dataUrl;
+    }
+  }
+
+  if (low && high) {
+    return Math.abs(low.bytes - SCREENSHOT_TARGET_BYTES) < Math.abs(high.bytes - SCREENSHOT_TARGET_BYTES)
+      ? low.dataUrl
+      : high.dataUrl;
+  }
+  return (high || low)?.dataUrl || renderPngDataUrlAtScale(svg, width, height, startScale);
+}
+
+async function renderCurrentBrowserScreenshot(
+  nodes: EventFlowNode[],
+  edges: EventFlowEdge[],
+  theme: EventlineTheme,
+): Promise<string> {
+  if (nodes.length === 0) {
+    throw new Error('Current eventline view is empty.');
+  }
+  const padding = 88;
+  const nodeById = new Map(nodes.map((node) => [node.id, node]));
+  const nodeBounds = nodes.reduce((bounds, node) => ({
+    left: Math.min(bounds.left, node.position.x - 44),
+    top: Math.min(bounds.top, node.position.y - 44),
+    right: Math.max(bounds.right, node.position.x + NODE_WIDTH + 44),
+    bottom: Math.max(bounds.bottom, node.position.y + NODE_HEIGHT + 44),
+  }), { left: Infinity, top: Infinity, right: -Infinity, bottom: -Infinity });
+  const viewportX = nodeBounds.left - padding;
+  const viewportY = nodeBounds.top - padding;
+  const width = Math.max(320, nodeBounds.right - nodeBounds.left + padding * 2);
+  const height = Math.max(240, nodeBounds.bottom - nodeBounds.top + padding * 2);
+  const colors = themeCssVariables(theme);
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" style="--surface:${colors.surface};--text:${colors.text};--edge-base:${colors.edgeBase}">
+    <defs>
+      <pattern id="grid" width="64" height="64" patternUnits="userSpaceOnUse">
+        <path d="M 64 0 L 0 0 0 64" fill="none" stroke="${colors.gridA}" stroke-width="1" />
+        <path d="M 32 0 L 32 64 M 0 32 L 64 32" fill="none" stroke="${colors.gridB}" stroke-width="1" opacity="0.55" />
+      </pattern>
+      <linearGradient id="edgeGradient" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="1" y2="0">
+        <stop offset="0%" stop-color="${colors.red}" />
+        <stop offset="52%" stop-color="${colors.purple}" />
+        <stop offset="100%" stop-color="${colors.blue}" />
+      </linearGradient>
+      <linearGradient id="iconBg" x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0%" stop-color="${colors.red}" />
+        <stop offset="48%" stop-color="${colors.purple}" />
+        <stop offset="100%" stop-color="${colors.blue}" />
+      </linearGradient>
+      <filter id="nodeOuterGlow" x="-120%" y="-120%" width="340%" height="340%" color-interpolation-filters="sRGB">
+        <feGaussianBlur in="SourceAlpha" stdDeviation="9" result="nodeGlowBlueBlur" />
+        <feOffset in="nodeGlowBlueBlur" dx="10" dy="0" result="nodeGlowBlueOffset" />
+        <feFlood flood-color="${colors.nodeShadowBlue}" flood-opacity="1" result="nodeGlowBlueColor" />
+        <feComposite in="nodeGlowBlueColor" in2="nodeGlowBlueOffset" operator="in" result="nodeGlowBlue" />
+        <feGaussianBlur in="SourceAlpha" stdDeviation="9" result="nodeGlowRedBlur" />
+        <feOffset in="nodeGlowRedBlur" dx="-10" dy="0" result="nodeGlowRedOffset" />
+        <feFlood flood-color="${colors.nodeShadowRed}" flood-opacity="1" result="nodeGlowRedColor" />
+        <feComposite in="nodeGlowRedColor" in2="nodeGlowRedOffset" operator="in" result="nodeGlowRed" />
+        <feGaussianBlur in="SourceAlpha" stdDeviation="11" result="nodeGlowPurpleBlur" />
+        <feFlood flood-color="${colors.nodeShadowPurple}" flood-opacity="1" result="nodeGlowPurpleColor" />
+        <feComposite in="nodeGlowPurpleColor" in2="nodeGlowPurpleBlur" operator="in" result="nodeGlowPurple" />
+        <feMerge>
+          <feMergeNode in="nodeGlowBlue" />
+          <feMergeNode in="nodeGlowRed" />
+          <feMergeNode in="nodeGlowPurple" />
+          <feMergeNode in="SourceGraphic" />
+        </feMerge>
+      </filter>
+      <filter id="iconGlow" x="-80%" y="-80%" width="260%" height="260%" color-interpolation-filters="sRGB">
+        <feDropShadow dx="0" dy="0" stdDeviation="9" flood-color="${colors.iconGlowBlue}" flood-opacity="1" />
+      </filter>
+      <filter id="edgeGlow" x="-60%" y="-60%" width="220%" height="220%" color-interpolation-filters="sRGB">
+        <feDropShadow dx="0" dy="0" stdDeviation="3" flood-color="${colors.edgeGlowBlue}" flood-opacity="1" />
+        <feDropShadow dx="0" dy="0" stdDeviation="3.4" flood-color="${colors.edgeGlowRed}" flood-opacity="1" />
+      </filter>
+      <linearGradient id="nodeRing" x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0%" stop-color="${colors.red}" />
+        <stop offset="50%" stop-color="${colors.purple}" />
+        <stop offset="100%" stop-color="${colors.blue}" />
+      </linearGradient>
+      <marker id="arrow" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="3" markerHeight="3" markerUnits="strokeWidth" orient="auto-start-reverse">
+        <path d="M2 2 L10 6 L2 10 Z" fill="${colors.blue}" opacity="0.94" />
+      </marker>
+    </defs>
+    <rect width="100%" height="100%" fill="${colors.bg}" />
+    <rect width="100%" height="100%" fill="url(#grid)" />
+    <g>${edges.map((edge) => renderScreenshotEdge(edge, nodeById, viewportX, viewportY)).join('')}</g>
+    <g>${nodes.map((node) => renderScreenshotNode(node, viewportX, viewportY)).join('')}</g>
+  </svg>`;
+  return browserPngFromSvg(svg, width, height);
+}
+
+async function exportBackendEventlineImage(): Promise<string> {
+  return requestEventlineImageExport(EVENTLINE_IMAGE_EXPORT_ENDPOINT, { theme: 'light' });
+}
+
+async function requestEventlineImageExport(endpoint: string, body: Record<string, unknown>): Promise<string> {
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json; charset=utf-8' },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to export eventline image: ${response.status}`);
+  }
+  const payload = await response.json() as unknown;
+  if (!payload || typeof payload !== 'object') {
+    throw new Error('eventline image export returned an invalid payload.');
+  }
+  const path = normalizeString((payload as Record<string, unknown>).path);
+  if (!path) {
+    throw new Error('eventline image export did not return a path.');
+  }
+  return path;
+}
+
 function writeStoredEvents(events: EventlineJsonlEvent[]): string {
   const jsonl = eventsToJsonl(events);
   window.localStorage.setItem(EVENTLINE_JSONL_STORAGE_KEY, jsonl);
@@ -1639,21 +2095,24 @@ function parseAccessArgs(raw: string): EventlineAccessArgs {
   }
   const record = parsed as Record<string, unknown>;
   const mode = normalizeString(record.mode, 'full');
-  if (!['full', 'brief'].includes(mode)) {
-    throw new Error('eventline.access mode must be "full" or "brief".');
+  if (!['full', 'brief', 'img'].includes(mode)) {
+    throw new Error('eventline.access mode must be "full", "brief", or "img".');
   }
-  const treeId = readAlias(record, ['treeId', 'tree_id']) || undefined;
-  const nodeId = readAlias(record, ['nodeId', 'node_id', 'id']) || undefined;
+  const treeId = readAlias(record, ['tree_id', 'treeId']) || undefined;
+  const nodeId = readAlias(record, ['node_id', 'nodeId', 'id']) || undefined;
+  if (mode === 'img' && (treeId || nodeId)) {
+    throw new Error('eventline.access img mode does not accept tree_id or node_id.');
+  }
   if (treeId && nodeId) {
-    throw new Error('eventline.access accepts either treeId or nodeId, not both.');
+    throw new Error('eventline.access accepts either tree_id or node_id, not both.');
   }
   if (nodeId && mode === 'brief') {
-    throw new Error('eventline.access nodeId lookup only supports mode "full".');
+    throw new Error('eventline.access node_id lookup only supports mode "full".');
   }
   return {
     mode: mode as AccessMode,
-    treeId,
-    nodeId,
+    tree_id: treeId,
+    node_id: nodeId,
   };
 }
 
@@ -1834,12 +2293,15 @@ function accessFullMarkdown(graph: EventlineGraph, mode: AccessMode): string {
 }
 
 function accessEventline(graph: EventlineGraph, args: EventlineAccessArgs): string {
-  if (args.nodeId) {
-    return accessNodeMarkdown(graph, args.nodeId);
+  if (args.node_id) {
+    return accessNodeMarkdown(graph, args.node_id);
   }
   const mode = args.mode || 'full';
-  if (args.treeId) {
-    return accessTreeMarkdown(graph, args.treeId, mode);
+  if (mode === 'img') {
+    return '';
+  }
+  if (args.tree_id) {
+    return accessTreeMarkdown(graph, args.tree_id, mode);
   }
   return accessFullMarkdown(graph, mode);
 }
@@ -1886,20 +2348,116 @@ function AccessMarkdownView({ markdown }: { markdown: string }) {
   );
 }
 
-function AccessResultPanel({ markdown, onClose }: { markdown: string; onClose: () => void }) {
+type AccessResult = {
+  kind: 'markdown' | 'image';
+  content: string;
+};
+
+type ScreenshotPreview = {
+  dataUrl: string;
+  filename: string;
+  capturedAt: string;
+  isExpanded: boolean;
+};
+
+function AccessResultPanel({ result, onClose }: { result: AccessResult; onClose: () => void }) {
   return (
     <section className="access-result-panel" aria-label="eventline access result">
       <div className="access-result-head">
         <span>eventline.access result</span>
         <button type="button" aria-label="Close eventline access result" onClick={onClose}>×</button>
       </div>
-      <AccessMarkdownView markdown={markdown} />
+      {result.kind === 'image' ? (
+        <div className="access-image-result">
+          <a href={result.content} target="_blank" rel="noreferrer">{result.content}</a>
+          <img src={result.content} alt="Rendered eventline graph" />
+        </div>
+      ) : (
+        <AccessMarkdownView markdown={result.content} />
+      )}
     </section>
+  );
+}
+
+async function imagePathToDataUrl(path: string): Promise<string> {
+  const response = await fetch(`${path}${path.includes('?') ? '&' : '?'}t=${Date.now()}`, { cache: 'no-store' });
+  if (!response.ok) {
+    throw new Error(`Failed to read screenshot image: ${response.status}`);
+  }
+  const blob = await response.blob();
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(reader.error || new Error('Failed to convert screenshot image.'));
+    reader.readAsDataURL(blob);
+  });
+}
+
+function ScreenshotPreviewPanel({
+  preview,
+  onToggleExpanded,
+  onClose,
+  onSave,
+}: {
+  preview: ScreenshotPreview;
+  onToggleExpanded: () => void;
+  onClose: () => void;
+  onSave: () => void;
+}) {
+  return (
+    <>
+      <section
+        className={`screenshot-preview-panel ${preview.isExpanded ? 'is-expanded' : ''}`}
+        data-capture-exclude="true"
+        aria-label="Eventline screenshot preview"
+      >
+        <div className="screenshot-preview-head">
+          <div>
+            <span>Screenshot</span>
+            <time>{displayDate(preview.capturedAt)}</time>
+          </div>
+          <div className="screenshot-preview-actions">
+            <button type="button" aria-label="Save screenshot" title="Save screenshot" onClick={onSave}>
+              <Download size={14} aria-hidden="true" />
+            </button>
+            <button type="button" aria-label="Close screenshot preview" title="Close screenshot preview" onClick={onClose}>
+              <X size={15} aria-hidden="true" />
+            </button>
+          </div>
+        </div>
+        <button type="button" className="screenshot-preview-image-button" onClick={onToggleExpanded}>
+          <img src={preview.dataUrl} alt="Eventline screenshot preview" />
+        </button>
+      </section>
+      {preview.isExpanded ? (
+        <div className="screenshot-lightbox" data-capture-exclude="true" role="dialog" aria-modal="true" aria-label="Eventline screenshot">
+          <div className="screenshot-lightbox-head">
+            <span>{preview.filename}</span>
+            <div>
+              <button type="button" aria-label="Save screenshot" title="Save screenshot" onClick={onSave}>
+                <Download size={14} aria-hidden="true" />
+              </button>
+              <button type="button" aria-label="Minimize screenshot" title="Minimize screenshot" onClick={onToggleExpanded}>
+                <Minimize2 size={15} aria-hidden="true" />
+              </button>
+              <button type="button" aria-label="Close screenshot preview" title="Close screenshot preview" onClick={onClose}>
+                <X size={15} aria-hidden="true" />
+              </button>
+            </div>
+          </div>
+          <img src={preview.dataUrl} alt="Expanded eventline screenshot" />
+        </div>
+      ) : null}
+    </>
   );
 }
 
 function isPositionNodeChange(change: NodeChange<EventFlowNode>): change is Extract<NodeChange<EventFlowNode>, { type: 'position' }> {
   return change.type === 'position' && Boolean(change.position);
+}
+
+function isSelectionNodeChange(change: NodeChange<EventFlowNode>): change is Extract<NodeChange<EventFlowNode>, { type: 'select' }> {
+  return change.type === 'select';
 }
 
 function overlapArea(left: RectLike, right: RectLike): number {
@@ -2064,6 +2622,7 @@ function buildEdgeRenderData(graph: EventlineGraph, edge: EventEdgeRecord): Even
 function EventNodeComponent({ data }: { data: EventNodeData }) {
   const nodeRef = useRef<HTMLDivElement | null>(null);
   const tooltipRef = useRef<HTMLDivElement | null>(null);
+  const skipSelectClickRef = useRef(false);
   const [tooltipPosition, setTooltipPosition] = useState<TooltipPosition>(DEFAULT_TOOLTIP_POSITION);
   const emojiIcons = emojiIconsFor(data.icon);
   const Icon = emojiIcons.length === 0 ? (IconByName[data.icon || 'default'] || IconByName.default) : null;
@@ -2150,13 +2709,34 @@ function EventNodeComponent({ data }: { data: EventNodeData }) {
   return (
     <div
       ref={nodeRef}
-      className={`event-node ${data.isPinned ? 'is-pinned' : ''} ${data.isChanged ? 'is-changed' : ''} ${data.isTreeHighlighted ? 'is-tree-highlighted' : ''}`}
+      className={`event-node ${data.isPinned ? 'is-pinned' : ''} ${data.isSelected ? 'is-selected' : ''} ${data.isSelectMode ? 'is-select-mode' : ''} ${data.isChanged ? 'is-changed' : ''} ${data.isTreeHighlighted ? 'is-tree-highlighted' : ''}`}
       style={nodeStyle}
       aria-label={`${data.title} ${data.updatedBy} ${data.versionId}`}
       onMouseEnter={scheduleTooltipPlacement}
+      onPointerDown={(event) => {
+        if (data.isSelectMode && (event.ctrlKey || event.metaKey)) {
+          event.stopPropagation();
+          skipSelectClickRef.current = true;
+          data.onSelectNode(data.id, true);
+        }
+      }}
       onClick={(event) => {
+        if (data.isSelectMode) {
+          event.stopPropagation();
+          if (skipSelectClickRef.current) {
+            skipSelectClickRef.current = false;
+            return;
+          }
+          data.onSelectNode(data.id, event.ctrlKey || event.metaKey);
+          return;
+        }
         event.stopPropagation();
         data.onTogglePinned(data.id);
+      }}
+      onContextMenu={(event) => {
+        if (data.isSelectMode) {
+          event.preventDefault();
+        }
       }}
     >
       <div className="event-node-shell">
@@ -2184,41 +2764,43 @@ function EventNodeComponent({ data }: { data: EventNodeData }) {
           <Handle id="source-bottom" type="source" position={Position.Bottom} className="event-handle event-handle-bottom" />
         </div>
       </div>
-      <div
-        ref={tooltipRef}
-        className="event-tooltip nodrag nowheel"
-        data-placement={tooltipPosition.placement}
-        style={tooltipStyle}
-        onPointerDown={(event) => event.stopPropagation()}
-        onClick={(event) => event.stopPropagation()}
-      >
-        <div className="event-tooltip-head">
-          <span>{data.title}</span>
-          <span className="event-tooltip-agent">{data.updatedBy}</span>
-        </div>
-        <div className="event-tooltip-detail">{data.detail}</div>
-        {data.attachments.length > 0 ? (
-          <div className="event-tooltip-attachments">
-            {data.attachments.map((attachment) => (
-              attachment.type === 'image' ? (
-                <figure key={`${attachment.type}:${attachment.uri}`} className="event-attachment-image">
-                  <img src={attachment.uri} alt={attachment.label} />
-                  <figcaption>{attachment.label}</figcaption>
-                </figure>
-              ) : (
-                <div key={`${attachment.type}:${attachment.uri}`} className="event-attachment-file">
-                  <FileText size={13} />
-                  <span>{attachment.label}</span>
-                  <AttachmentUri uri={attachment.uri} />
-                </div>
-              )
-            ))}
+      {!data.isSelectMode ? (
+        <div
+          ref={tooltipRef}
+          className="event-tooltip nodrag nowheel"
+          data-placement={tooltipPosition.placement}
+          style={tooltipStyle}
+          onPointerDown={(event) => event.stopPropagation()}
+          onClick={(event) => event.stopPropagation()}
+        >
+          <div className="event-tooltip-head">
+            <span>{data.title}</span>
+            <span className="event-tooltip-agent">By: {data.updatedBy}</span>
           </div>
-        ) : null}
-        <div className="event-tooltip-foot">
-          <span>更新 {displayDate(data.updatedAt)} ({data.id}::{data.versionId})</span>
+          <div className="event-tooltip-detail">{data.detail}</div>
+          {data.attachments.length > 0 ? (
+            <div className="event-tooltip-attachments">
+              {data.attachments.map((attachment) => (
+                attachment.type === 'image' ? (
+                  <figure key={`${attachment.type}:${attachment.uri}`} className="event-attachment-image">
+                    <img src={attachment.uri} alt={attachment.label} />
+                    <figcaption>{attachment.label}</figcaption>
+                  </figure>
+                ) : (
+                  <div key={`${attachment.type}:${attachment.uri}`} className="event-attachment-file">
+                    <FileText size={13} />
+                    <span>{attachment.label}</span>
+                    <AttachmentUri uri={attachment.uri} />
+                  </div>
+                )
+              ))}
+            </div>
+          ) : null}
+          <div className="event-tooltip-foot">
+            <span>Update: {displayUpdateDate(data.updatedAt)} ({data.id}::{data.versionId})</span>
+          </div>
         </div>
-      </div>
+      ) : null}
     </div>
   );
 }
@@ -2400,8 +2982,11 @@ function buildFlowNodes(
   graph: EventlineGraph,
   changedNodeIds: Set<string>,
   pinnedNodeIds: Set<string>,
+  selectedNodeIds: Set<string>,
+  isSelectMode: boolean,
   visibleTreeIds: Set<string>,
   highlightedTreeIds: Set<string>,
+  onSelectNode: (nodeId: string, shouldExtendSelection: boolean) => void,
   onTogglePinned: (nodeId: string) => void,
 ): EventFlowNode[] {
   return Object.values(graph.nodes).filter((node) => visibleTreeIds.has(node.treeId)).map((node) => ({
@@ -2412,16 +2997,21 @@ function buildFlowNodes(
       ...node,
       isChanged: changedNodeIds.has(node.id),
       isPinned: pinnedNodeIds.has(node.id),
+      isSelected: selectedNodeIds.has(node.id),
+      isSelectMode,
       isTreeHighlighted: highlightedTreeIds.has(node.treeId),
       treeHighlightColor: treeHighlightColor(graph.treeOrder.indexOf(node.treeId)),
+      onSelectNode,
       onTogglePinned,
     },
     width: NODE_WIDTH,
     height: NODE_HEIGHT,
-    zIndex: pinnedNodeIds.has(node.id) ? 2000 : 10,
+    measured: { width: NODE_WIDTH, height: NODE_HEIGHT },
+    zIndex: selectedNodeIds.has(node.id) ? 2200 : pinnedNodeIds.has(node.id) ? 2000 : 10,
     draggable: true,
     deletable: false,
-    selectable: true,
+    selectable: isSelectMode,
+    selected: selectedNodeIds.has(node.id),
     sourcePosition: Position.Right,
     targetPosition: Position.Left,
   }));
@@ -2783,6 +3373,7 @@ function ToolPanel({
 }
 
 function EventlineCanvas() {
+  const isBackendExportMode = useMemo(() => isBackendImageExportMode(), []);
   const initialEvents = useMemo(() => {
     try {
       return readStoredEvents();
@@ -2806,25 +3397,55 @@ function EventlineCanvas() {
   const [toolSchemaItems, setToolSchemaItems] = useState<ToolSchemaItemDefinition[]>(TOOL_SCHEMA_ITEMS);
   const [activeNodeId, setActiveNodeId] = useState<string | null>(null);
   const [pinnedNodeIds, setPinnedNodeIds] = useState<Set<string>>(new Set());
+  const [selectedNodeIds, setSelectedNodeIds] = useState<Set<string>>(new Set());
+  const [isSelectMode, setIsSelectMode] = useState(false);
   const [changedNodeIds, setChangedNodeIds] = useState<Set<string>>(new Set());
   const [schemaTestInputs, setSchemaTestInputs] = useState<Record<string, string>>(() => Object.fromEntries(
     TOOL_SCHEMA_ITEMS.map((item) => [item.id, item.testInput]),
   ));
   const [schemaTestErrors, setSchemaTestErrors] = useState<Record<string, string>>({});
-  const [accessOutput, setAccessOutput] = useState(() => accessEventline(initialReplay.graph, { mode: 'full' }));
+  const [accessResult, setAccessResult] = useState<AccessResult>(() => ({
+    kind: 'markdown',
+    content: accessEventline(initialReplay.graph, { mode: 'full' }),
+  }));
   const [isAccessResultOpen, setIsAccessResultOpen] = useState(false);
+  const [screenshotPreview, setScreenshotPreview] = useState<ScreenshotPreview | null>(null);
+  const [isCapturingScreenshot, setIsCapturingScreenshot] = useState(false);
   const [parseError, setParseError] = useState(initialReplay.notices.join('\n'));
   const [isPlaying, setIsPlaying] = useState(false);
   const [playbackFrame, setPlaybackFrame] = useState(initialEvents.length);
-  const [theme, setTheme] = useState<EventlineTheme>('DARK');
-  const [visibleTreeIds, setVisibleTreeIds] = useState<Set<string>>(() => new Set(initialReplay.graph.treeOrder));
-  const [highlightedTreeIds, setHighlightedTreeIds] = useState<Set<string>>(new Set());
+  const [theme, setTheme] = useState<EventlineTheme>(() => (isBackendExportMode ? backendExportTheme() : 'DARK'));
+  const [visibleTreeIds, setVisibleTreeIds] = useState<Set<string>>(() => {
+    const visibleIds = isBackendExportMode ? idsParam('visible_tree_ids') : [];
+    return new Set(visibleIds.length > 0 ? visibleIds : initialReplay.graph.treeOrder);
+  });
+  const [highlightedTreeIds, setHighlightedTreeIds] = useState<Set<string>>(() => (
+    isBackendExportMode ? new Set(idsParam('highlighted_tree_ids')) : new Set()
+  ));
   const playbackRunRef = useRef(0);
   const knownTreeIdsRef = useRef<Set<string>>(new Set(initialReplay.graph.treeOrder));
   const treeVisibilityTouchedRef = useRef(false);
-  const { fitView, zoomIn, setViewport } = useReactFlow();
+  const { fitView } = useReactFlow();
   const themeRendering = THEME_RENDERING[theme];
   const graphTreeIds = useMemo(() => graph.treeOrder.filter((treeId) => Boolean(graph.trees[treeId])), [graph.treeOrder, graph.trees]);
+
+  useEffect(() => {
+    if (!isBackendExportMode) {
+      window.__eventlineExportReady = false;
+      window.__eventlineExportStatus = 'interactive';
+      return;
+    }
+    treeVisibilityTouchedRef.current = false;
+    setTheme(backendExportTheme());
+    setIsAccessResultOpen(false);
+    setActiveNodeId(null);
+    setPinnedNodeIds(new Set());
+    setSelectedNodeIds(new Set());
+    setIsSelectMode(false);
+    setHighlightedTreeIds(new Set(idsParam('highlighted_tree_ids')));
+    const visibleIds = idsParam('visible_tree_ids');
+    setVisibleTreeIds(new Set(visibleIds.length > 0 ? visibleIds : graphTreeIds));
+  }, [graphTreeIds, isBackendExportMode]);
 
   useEffect(() => {
     let cancelled = false;
@@ -2887,6 +3508,7 @@ function EventlineCanvas() {
     const replayed = replayJsonlEventsFrame(events, frame);
     setPlaybackFrame(Math.max(0, Math.min(frame, events.length)));
     setGraph(applyStoredLayout(replayed.graph, layoutOverrides));
+    setSelectedNodeIds(new Set());
     setParseError(replayed.notices.join('\n'));
     if (shouldMarkChanged) {
       markChanged(replayed.changedNodeIds);
@@ -2900,6 +3522,7 @@ function EventlineCanvas() {
     setScript(events.map(jsonlEventToToolCall));
     setPlaybackFrame(events.length);
     setGraph(applyStoredLayout(replayed.graph, layoutOverrides));
+    setSelectedNodeIds(new Set());
     setParseError(replayed.notices.join('\n'));
   }, [layoutOverrides]);
 
@@ -2933,6 +3556,7 @@ function EventlineCanvas() {
     setScript(events.map(jsonlEventToToolCall));
     setPlaybackFrame(events.length);
     setGraph(applyStoredLayout(replayed.graph, layoutOverrides));
+    setSelectedNodeIds(new Set());
     setParseError(replayed.notices.join('\n'));
     markChanged(changedIds);
   }, [layoutOverrides, markChanged]);
@@ -2959,6 +3583,7 @@ function EventlineCanvas() {
     setEventJsonl(jsonl);
     setPlaybackFrame(nextEvents.length);
     setGraph(applyStoredLayout(nextGraph, layoutOverrides));
+    setSelectedNodeIds(new Set());
     markChanged(changed);
     setScript(nextEvents.map(jsonlEventToToolCall));
     setParseError(notices.join('\n'));
@@ -2975,6 +3600,34 @@ function EventlineCanvas() {
     }));
   }, []);
 
+  const handleCloseScreenshotPreview = useCallback(() => {
+    setScreenshotPreview(null);
+  }, []);
+
+  const handleToggleScreenshotPreviewExpanded = useCallback(() => {
+    setScreenshotPreview((prev) => (prev ? { ...prev, isExpanded: !prev.isExpanded } : prev));
+  }, []);
+
+  const handleSaveScreenshotPreview = useCallback(() => {
+    if (!screenshotPreview) {
+      return;
+    }
+    downloadDataUrl(screenshotPreview.dataUrl, screenshotPreview.filename);
+  }, [screenshotPreview]);
+
+  const handleToggleSelectMode = useCallback(() => {
+    setIsSelectMode((prev) => {
+      const next = !prev;
+      if (next) {
+        setPinnedNodeIds(new Set());
+        setActiveNodeId(null);
+      } else {
+        setSelectedNodeIds(new Set());
+      }
+      return next;
+    });
+  }, []);
+
   const handleRunSchemaTest = useCallback((toolId: string) => {
     const item = toolSchemaItems.find((candidate) => candidate.id === toolId);
     if (!item) {
@@ -2984,7 +3637,26 @@ function EventlineCanvas() {
     try {
       if (item.kind === 'read') {
         const args = parseAccessToolCall(raw);
-        setAccessOutput(accessEventline(graph, args));
+        if (args.mode === 'img') {
+          void exportBackendEventlineImage()
+            .then((path) => {
+              setAccessResult({ kind: 'image', content: path });
+              setIsAccessResultOpen(true);
+              setParseError('');
+              setSchemaTestErrors((prev) => ({
+                ...prev,
+                [toolId]: '',
+              }));
+            })
+            .catch((error) => {
+              setSchemaTestErrors((prev) => ({
+                ...prev,
+                [toolId]: error instanceof Error ? error.message : String(error),
+              }));
+            });
+          return;
+        }
+        setAccessResult({ kind: 'markdown', content: accessEventline(graph, args) });
         setIsAccessResultOpen(true);
         setSchemaTestErrors((prev) => ({
           ...prev,
@@ -3026,7 +3698,7 @@ function EventlineCanvas() {
       applyPlaybackFrame(eventLog, nextFrame, true);
       if (nextFrame >= eventLog.length) {
         setIsPlaying(false);
-        window.setTimeout(() => fitView({ padding: 0.18, duration: 500 }), 80);
+        window.setTimeout(() => fitView(INTERACTIVE_FIT_VIEW_OPTIONS), 80);
         return;
       }
       window.setTimeout(() => tick(nextFrame), PLAYBACK_STEP_DELAY_MS);
@@ -3129,6 +3801,20 @@ function EventlineCanvas() {
   }, []);
 
   const handleNodesChange = useCallback((changes: NodeChange<EventFlowNode>[]) => {
+    const selectionChanges = changes.filter(isSelectionNodeChange);
+    if (selectionChanges.length > 0) {
+      setSelectedNodeIds((prev) => {
+        const next = new Set(prev);
+        for (const change of selectionChanges) {
+          if (change.selected) {
+            next.add(change.id);
+          } else {
+            next.delete(change.id);
+          }
+        }
+        return next;
+      });
+    }
     const positionChanges = changes.filter(isPositionNodeChange);
     if (positionChanges.length === 0) {
       return;
@@ -3151,16 +3837,18 @@ function EventlineCanvas() {
     });
   }, []);
 
-  const handleNodeDragStop = useCallback((_event: unknown, node: EventFlowNode) => {
-    const position = {
-      x: Math.round(node.position.x),
-      y: Math.round(node.position.y),
-    };
+  const handleNodeDragStop = useCallback((_event: unknown, node: EventFlowNode, nodes: EventFlowNode[] = []) => {
+    const movedNodes = (nodes.length > 0 ? nodes : [node]).filter((item, index, list) => (
+      list.findIndex((candidate) => candidate.id === item.id) === index
+    ));
     setLayoutOverrides((prev) => {
-      const next = {
-        ...prev,
-        [node.id]: position,
-      };
+      const next = { ...prev };
+      for (const movedNode of movedNodes) {
+        next[movedNode.id] = {
+          x: Math.round(movedNode.position.x),
+          y: Math.round(movedNode.position.y),
+        };
+      }
       writeStoredLayout(next);
       return next;
     });
@@ -3179,17 +3867,91 @@ function EventlineCanvas() {
     });
   }, []);
 
+  const handleNodeSelect = useCallback((nodeId: string, shouldExtendSelection: boolean) => {
+    setSelectedNodeIds((prev) => {
+      if (!shouldExtendSelection) {
+        return new Set([nodeId]);
+      }
+      const next = new Set(prev);
+      if (next.has(nodeId)) {
+        next.delete(nodeId);
+      } else {
+        next.add(nodeId);
+      }
+      return next;
+    });
+    setActiveNodeId(nodeId);
+  }, []);
+
   const flowNodes = useMemo(
-    () => buildFlowNodes(graph, changedNodeIds, pinnedNodeIds, visibleTreeIds, highlightedTreeIds, handleNodeClick),
-    [changedNodeIds, graph, handleNodeClick, highlightedTreeIds, pinnedNodeIds, visibleTreeIds],
+    () => buildFlowNodes(
+      graph,
+      changedNodeIds,
+      pinnedNodeIds,
+      selectedNodeIds,
+      isSelectMode,
+      visibleTreeIds,
+      highlightedTreeIds,
+      handleNodeSelect,
+      handleNodeClick,
+    ),
+    [changedNodeIds, graph, handleNodeClick, handleNodeSelect, highlightedTreeIds, isSelectMode, pinnedNodeIds, selectedNodeIds, visibleTreeIds],
   );
   const flowEdges = useMemo(() => buildFlowEdges(graph, visibleTreeIds), [graph, visibleTreeIds]);
   const selectedNode = activeNodeId ? graph.nodes[activeNodeId] || null : null;
 
+  const handleExportImage = useCallback(async () => {
+    setIsCapturingScreenshot(true);
+    try {
+      const capturedAt = new Date().toISOString();
+      const dataUrl = await renderCurrentBrowserScreenshot(flowNodes, flowEdges, theme);
+      setScreenshotPreview({
+        dataUrl,
+        filename: imageExportFileName('eventline-current'),
+        capturedAt,
+        isExpanded: false,
+      });
+      setParseError('');
+    } catch (error) {
+      setParseError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setIsCapturingScreenshot(false);
+    }
+  }, [flowEdges, flowNodes, theme]);
+
+  useEffect(() => {
+    if (!isBackendExportMode) {
+      return undefined;
+    }
+    let cancelled = false;
+    const waitFrame = () => new Promise<void>((resolve) => {
+      window.requestAnimationFrame(() => resolve());
+    });
+    window.__eventlineExportReady = false;
+    window.__eventlineExportStatus = flowNodes.length === 0 ? 'empty' : 'layout-pending';
+    const frameId = window.setTimeout(() => {
+      void (async () => {
+        await Promise.resolve(fitView({ padding: 0.28, duration: 0 }));
+        await waitFrame();
+        await waitFrame();
+        await waitFrame();
+        if (cancelled) {
+          return;
+        }
+        window.__eventlineExportReady = true;
+        window.__eventlineExportStatus = 'ready';
+      })();
+    }, 180);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(frameId);
+    };
+  }, [fitView, flowNodes.length, isBackendExportMode]);
+
   return (
-    <div className={`eventline-shell theme-${theme.toLowerCase()}`}>
-      <main className="flow-shell">
-        <div className="flow-toolbar">
+    <div className={`eventline-shell theme-${theme.toLowerCase()} ${isBackendExportMode ? 'is-backend-export' : ''}`}>
+      <main className="flow-shell eventline-capture-surface">
+        <div className="flow-toolbar" data-capture-exclude="true">
           <div className="flow-toolbar-title">
             <Workflow size={16} />
             <span>Project Eventline</span>
@@ -3217,15 +3979,9 @@ function EventlineCanvas() {
               <Palette size={14} />
               {theme}
             </button>
-            <button type="button" onClick={() => zoomIn({ duration: 240 })}>
-              <ZoomIn size={14} />
-              Zoom
-            </button>
-            <button type="button" onClick={() => fitView({ padding: 0.2, duration: 420 })}>
-              Fit
-            </button>
-            <button type="button" onClick={() => setViewport({ x: 0, y: 0, zoom: 1 }, { duration: 420 })}>
-              Reset
+            <button type="button" onClick={() => void handleExportImage()} disabled={isCapturingScreenshot}>
+              <Camera size={14} />
+              {isCapturingScreenshot ? 'Shooting' : 'Shot'}
             </button>
           </div>
         </div>
@@ -3235,8 +3991,16 @@ function EventlineCanvas() {
             <span>empty eventline</span>
           </div>
         ) : null}
-        {isAccessResultOpen ? (
-          <AccessResultPanel markdown={accessOutput} onClose={() => setIsAccessResultOpen(false)} />
+        {isAccessResultOpen && !isBackendExportMode ? (
+          <AccessResultPanel result={accessResult} onClose={() => setIsAccessResultOpen(false)} />
+        ) : null}
+        {screenshotPreview && !isBackendExportMode ? (
+          <ScreenshotPreviewPanel
+            preview={screenshotPreview}
+            onToggleExpanded={handleToggleScreenshotPreviewExpanded}
+            onClose={handleCloseScreenshotPreview}
+            onSave={handleSaveScreenshotPreview}
+          />
         ) : null}
         <ReactFlow
           nodes={flowNodes}
@@ -3247,15 +4011,40 @@ function EventlineCanvas() {
           onNodeDragStop={handleNodeDragStop}
           nodesDraggable
           nodesConnectable={false}
+          elementsSelectable={isSelectMode}
+          selectionOnDrag={isSelectMode}
+          selectionMode={SelectionMode.Partial}
+          selectionKeyCode={isSelectMode ? null : 'Shift'}
+          multiSelectionKeyCode={isSelectMode ? ['Control', 'Meta'] : null}
+          selectNodesOnDrag={isSelectMode}
+          panOnDrag={!isSelectMode}
+          panActivationKeyCode="Space"
+          panOnScroll={isSelectMode}
+          panOnScrollMode={PanOnScrollMode.Free}
+          panOnScrollSpeed={0.85}
           edgesFocusable={false}
           deleteKeyCode={null}
           fitView
+          fitViewOptions={INTERACTIVE_FIT_VIEW_OPTIONS}
           minZoom={0.22}
           maxZoom={3}
           defaultViewport={{ x: 60, y: 60, zoom: 0.9 }}
         >
           <Background color={themeRendering.backgroundColor} gap={28} size={1} />
-          <Controls showInteractive={false} className="eventline-controls" />
+          <Controls
+            showInteractive={false}
+            className="eventline-controls"
+            fitViewOptions={INTERACTIVE_FIT_VIEW_OPTIONS}
+          >
+            <ControlButton
+              className={isSelectMode ? 'is-active' : ''}
+              title={isSelectMode ? 'Exit Select Mode' : 'Select and Move Nodes'}
+              aria-label={isSelectMode ? 'Exit Select Mode' : 'Select and Move Nodes'}
+              onClick={handleToggleSelectMode}
+            >
+              <MousePointer2 size={14} aria-hidden="true" />
+            </ControlButton>
+          </Controls>
           <MiniMap
             pannable
             zoomable
@@ -3289,19 +4078,21 @@ function EventlineCanvas() {
           </svg>
         </ReactFlow>
       </main>
-      <ToolPanel
-        graph={graph}
-        script={script}
-        eventJsonl={eventJsonl}
-        selectedNode={selectedNode}
-        toolSchemaItems={toolSchemaItems}
-        schemaTestInputs={schemaTestInputs}
-        schemaTestErrors={schemaTestErrors}
-        onSchemaTestInputChange={handleSchemaTestInputChange}
-        onRunSchemaTest={handleRunSchemaTest}
-        onReplaySample={handleReplaySample}
-        onResetLayout={handleResetLayout}
-      />
+      {!isBackendExportMode ? (
+        <ToolPanel
+          graph={graph}
+          script={script}
+          eventJsonl={eventJsonl}
+          selectedNode={selectedNode}
+          toolSchemaItems={toolSchemaItems}
+          schemaTestInputs={schemaTestInputs}
+          schemaTestErrors={schemaTestErrors}
+          onSchemaTestInputChange={handleSchemaTestInputChange}
+          onRunSchemaTest={handleRunSchemaTest}
+          onReplaySample={handleReplaySample}
+          onResetLayout={handleResetLayout}
+        />
+      ) : null}
     </div>
   );
 }

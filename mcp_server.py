@@ -4,6 +4,8 @@ import argparse
 import json
 import os
 import sys
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,6 +17,7 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
 PROJECT_ID = "eventline-demo"
 DEFAULT_ICON = "default"
+DEFAULT_FRONTEND_EXPORT_URL = "http://127.0.0.1:5174/eventline-data/mcp-export-image"
 EVENTLINE_TOOLS = {
     "eventline.create_tree",
     "eventline.upsert_node",
@@ -22,6 +25,7 @@ EVENTLINE_TOOLS = {
     "eventline.delete",
     "eventline.access",
 }
+mcp = FastMCP("eventline")
 
 
 def now_iso() -> str:
@@ -40,17 +44,11 @@ def normalize_after(value: str | list[str] | None) -> list[str]:
     return [value.strip()] if value.strip() else []
 
 
-def flatten_nested_payload(value: Any, keys: tuple[str, ...]) -> Any:
-    if not isinstance(value, dict):
-        return value
-    flattened = dict(value)
+def read_arg(args: dict[str, Any], *keys: str) -> Any:
     for key in keys:
-        nested = flattened.get(key)
-        if isinstance(nested, dict):
-            flattened.pop(key, None)
-            flattened = {**nested, **flattened}
-            break
-    return flattened
+        if key in args:
+            return args[key]
+    return None
 
 
 def fast_hash(value: str) -> str:
@@ -119,9 +117,8 @@ class CreateTreeInput(BaseModel):
 
     tree_id: str = Field(
         ...,
-        validation_alias=AliasChoices("tree_id", "treeId"),
         min_length=1,
-        description="Stable tree id, for example 'project-main'. Alias accepted: treeId.",
+        description="Stable tree id, for example 'project-main'.",
     )
     title: str = Field(..., min_length=1, description="Human-readable tree title.")
     from_agent: str = Field(..., min_length=1, description="Agent name that created this tree.")
@@ -130,31 +127,23 @@ class CreateTreeInput(BaseModel):
 
 
 class UpsertNodeInput(BaseModel):
-    model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
-    @model_validator(mode="before")
-    @classmethod
-    def flatten_common_nested_shapes(cls, value: Any) -> Any:
-        return flatten_nested_payload(value, ("event", "node", "payload", "detail"))
-
-    id: str = Field(
+    node_id: str = Field(
         ...,
-        validation_alias=AliasChoices("id", "node_id", "nodeId"),
         min_length=1,
-        description="Stable event node id. Common aliases accepted: node_id, nodeId.",
+        description="Stable event node id.",
     )
     tree_id: str = Field(
         ...,
-        validation_alias=AliasChoices("tree_id", "treeId"),
         min_length=1,
-        description="Owning tree id. Alias accepted: treeId.",
+        description="Owning tree id.",
     )
     title: str = Field(..., min_length=1, description="Short event title.")
     detail: str = Field(
         ...,
-        validation_alias=AliasChoices("detail", "summary", "description", "body", "content", "text"),
         min_length=1,
-        description="Full event detail for agent/user reading. Common aliases accepted: summary, description, body, content, text.",
+        description="Full event detail for agent/user reading.",
     )
     from_agent: str = Field(..., min_length=1, description="Agent name that created or updated this event.")
     icon: str | None = Field(default=None, description="Icon name or 1-2 emoji string. Defaults to 'default'.")
@@ -164,8 +153,7 @@ class UpsertNodeInput(BaseModel):
     )
     edge_label: str | None = Field(
         default=None,
-        validation_alias=AliasChoices("edge_label", "edgeLabel"),
-        description="Label used for implicit edges from 'after'. Alias accepted: edgeLabel.",
+        description="Label used for implicit edges from 'after'.",
     )
     attachments: list[AttachmentInput] = Field(default_factory=list, description="Optional file/image attachments.")
     at: str | None = Field(default=None, description="Optional ISO timestamp. Defaults to current time.")
@@ -176,33 +164,32 @@ class ConnectEventsInput(BaseModel):
 
     source: str = Field(
         ...,
-        validation_alias=AliasChoices("source", "source_id", "sourceId", "from_node_id", "fromNodeId", "from"),
+        validation_alias=AliasChoices("source", "source_id", "from_node_id", "from"),
         min_length=1,
         description=(
-            "Source node id or tree_id/node_id reference. Common aliases accepted: source_id, sourceId, "
-            "from_node_id, fromNodeId, from."
+            "Source node id or tree_id/node_id reference. Common aliases accepted: source_id, "
+            "from_node_id, from."
         ),
     )
     target: str = Field(
         ...,
-        validation_alias=AliasChoices("target", "target_id", "targetId", "to_node_id", "toNodeId", "to"),
+        validation_alias=AliasChoices("target", "target_id", "to_node_id", "to"),
         min_length=1,
         description=(
-            "Target node id or tree_id/node_id reference. Common aliases accepted: target_id, targetId, "
-            "to_node_id, toNodeId, to."
+            "Target node id or tree_id/node_id reference. Common aliases accepted: target_id, "
+            "to_node_id, to."
         ),
     )
     from_agent: str = Field(..., min_length=1, description="Agent name that created this edge.")
     tree_id: str | None = Field(
         default=None,
-        validation_alias=AliasChoices("tree_id", "treeId"),
-        description="Owning tree id for this edge. Alias accepted: treeId.",
+        description="Owning tree id for this edge.",
     )
     label: str | None = Field(default=None, description="Optional edge label.")
     id: str | None = Field(
         default=None,
-        validation_alias=AliasChoices("id", "edge_id", "edgeId"),
-        description="Optional stable edge id. Common aliases accepted: edge_id, edgeId.",
+        validation_alias=AliasChoices("id", "edge_id"),
+        description="Optional stable edge id. Common alias accepted: edge_id.",
     )
     at: str | None = Field(default=None, description="Optional ISO timestamp. Defaults to current time.")
 
@@ -213,16 +200,15 @@ class DeleteInput(BaseModel):
     from_agent: str = Field(..., min_length=1, description="Agent name that requested deletion.")
     node_id: str | None = Field(
         default=None,
-        validation_alias=AliasChoices("node_id", "nodeId", "id"),
+        validation_alias=AliasChoices("node_id", "id"),
         description=(
             "Node id or tree_id/node_id reference to delete. Deletes only this node plus incoming/outgoing edges. "
-            "Common aliases accepted: nodeId, id."
+            "Common alias accepted: id."
         ),
     )
     edge_id: str | None = Field(
         default=None,
-        validation_alias=AliasChoices("edge_id", "edgeId"),
-        description="Edge id to delete. Exclusive with node_id. Alias accepted: edgeId.",
+        description="Edge id to delete. Exclusive with node_id.",
     )
     reason: str | None = Field(default=None, description="Short reason for deletion.")
     at: str | None = Field(default=None, description="Optional ISO timestamp. Defaults to current time.")
@@ -237,21 +223,27 @@ class DeleteInput(BaseModel):
 class AccessInput(BaseModel):
     model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
 
-    mode: Literal["full", "brief"] = Field(default="full", description="full includes details; brief includes ids/titles/edges only.")
+    mode: Literal["full", "brief", "img"] = Field(
+        default="full",
+        description=(
+            "full includes details; brief includes ids/titles/edges only; img exports the rendered graph image path."
+        ),
+    )
     tree_id: str | None = Field(
         default=None,
-        validation_alias=AliasChoices("tree_id", "treeId"),
-        description="Optional tree id to inspect. Alias accepted: treeId.",
+        description="Optional tree id to inspect. Unavailable when mode is img.",
     )
     node_id: str | None = Field(
         default=None,
-        validation_alias=AliasChoices("node_id", "nodeId", "id"),
-        description="Optional node id to inspect. Node access is always full. Aliases accepted: nodeId, id.",
+        validation_alias=AliasChoices("node_id", "id"),
+        description="Optional node id to inspect. Node access is always full. Unavailable when mode is img.",
     )
     from_agent: str | None = Field(default=None, description="Accepted for consistency with write tools, but ignored.")
 
     @model_validator(mode="after")
     def validate_scope(self) -> "AccessInput":
+        if self.mode == "img" and (self.tree_id or self.node_id):
+            raise ValueError("img mode does not accept tree_id or node_id.")
         if self.tree_id and self.node_id:
             raise ValueError("tree_id and node_id are mutually exclusive.")
         if self.node_id and self.mode == "brief":
@@ -276,11 +268,11 @@ TOOL_DEFINITIONS: tuple[ToolDefinition, ...] = (
         name="eventline.access",
         title="eventline.access",
         kind="read",
-        description="Return the current eventline graph as agent-readable Markdown.",
+        description="Return the current eventline graph as agent-readable Markdown or export a rendered image path.",
         input_model=AccessInput,
         test_input={
             "tool": "eventline.access",
-            "from": "manual_reader",
+            "from_agent": "manual_reader",
             "arguments": {
                 "mode": "full",
             },
@@ -295,9 +287,9 @@ TOOL_DEFINITIONS: tuple[ToolDefinition, ...] = (
         input_model=CreateTreeInput,
         test_input={
             "tool": "eventline.create_tree",
-            "from": "manual_orchestrator",
+            "from_agent": "manual_orchestrator",
             "arguments": {
-                "treeId": "manual-tree",
+                "tree_id": "manual-tree",
                 "title": "Manual Test Tree",
             },
         },
@@ -311,15 +303,15 @@ TOOL_DEFINITIONS: tuple[ToolDefinition, ...] = (
         input_model=UpsertNodeInput,
         test_input={
             "tool": "eventline.upsert_node",
-            "from": "manual_agent",
+            "from_agent": "manual_agent",
             "arguments": {
-                "id": "manual-node",
-                "treeId": "project-main",
+                "node_id": "manual-node",
+                "tree_id": "project-main",
                 "icon": "🧪",
                 "title": "Manual node",
                 "detail": "A node created from the schema test box.",
                 "after": "project-kickoff",
-                "edgeLabel": "manual test",
+                "edge_label": "manual test",
             },
         },
     ),
@@ -332,11 +324,11 @@ TOOL_DEFINITIONS: tuple[ToolDefinition, ...] = (
         input_model=ConnectEventsInput,
         test_input={
             "tool": "eventline.connect_events",
-            "from": "manual_reviewer",
+            "from_agent": "manual_reviewer",
             "arguments": {
                 "source": "project-kickoff",
                 "target": "prototype-ready",
-                "treeId": "project-main",
+                "tree_id": "project-main",
                 "label": "manual link",
             },
         },
@@ -353,9 +345,9 @@ TOOL_DEFINITIONS: tuple[ToolDefinition, ...] = (
         input_model=DeleteInput,
         test_input={
             "tool": "eventline.delete",
-            "from": "manual_critic",
+            "from_agent": "manual_critic",
             "arguments": {
-                "edgeId": "edge_project-kickoff_prototype-ready_9835e8d2",
+                "edge_id": "edge_project-kickoff_prototype-ready_9835e8d2",
                 "reason": "schema test edge delete",
             },
         },
@@ -472,7 +464,7 @@ def append_event(tool: str, from_agent: str, arguments: dict[str, Any], at: str 
         "seq": next_seq,
         "project_id": PROJECT_ID,
         "at": at or now_iso(),
-        "from": from_agent,
+        "from_agent": from_agent,
         "tool": tool,
         "arguments": arguments,
     }
@@ -483,6 +475,67 @@ def append_event(tool: str, from_agent: str, arguments: dict[str, Any], at: str 
 
 def clear_events_file() -> None:
     write_events([])
+
+
+def image_export_dir() -> Path:
+    path = os.environ.get("EVENTLINE_EXPORT_DIR")
+    if path:
+        return Path(path).expanduser().resolve()
+    return Path(__file__).resolve().parent / "data" / "exports"
+
+
+def latest_image_export() -> dict[str, Any]:
+    latest_path = image_export_dir() / "latest.json"
+    if not latest_path.exists():
+        return {
+            "ok": False,
+            "mode": "img",
+            "error": "No frontend-rendered image exists yet. Use the Web UI Shot button or eventline.access img test in the frontend first.",
+        }
+    payload = json.loads(latest_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or not payload.get("path"):
+        return {
+            "ok": False,
+            "mode": "img",
+            "error": "Latest frontend-rendered image metadata is invalid.",
+        }
+    return {"ok": True, "mode": "img", "path": payload["path"]}
+
+
+def request_backend_image_export() -> dict[str, Any]:
+    url = os.environ.get("EVENTLINE_IMAGE_EXPORT_URL", DEFAULT_FRONTEND_EXPORT_URL)
+    request = urllib.request.Request(
+        url,
+        data=json.dumps({"theme": "light"}).encode("utf-8"),
+        headers={"content-type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        try:
+            payload = json.loads(error.read().decode("utf-8"))
+        except Exception:
+            payload = {"error": error.reason}
+        return {
+            "ok": False,
+            "mode": "img",
+            "error": payload.get("error") or f"Backend image export failed with HTTP {error.code}.",
+        }
+    except Exception as error:
+        return {
+            "ok": False,
+            "mode": "img",
+            "error": (
+                f"Backend image export service is unavailable at {url}. "
+                "Start the Eventline web service before calling eventline.access mode=img. "
+                f"Details: {error}"
+            ),
+        }
+    if not isinstance(payload, dict):
+        return {"ok": False, "mode": "img", "error": "Backend image export returned a non-object payload."}
+    return payload
 
 
 def current_graph() -> EventGraph:
@@ -546,22 +599,22 @@ def require_edge_id(graph: EventGraph, edge_id: str) -> str:
 def apply_event(graph: EventGraph, event: dict[str, Any]) -> None:
     tool = normalize_text(event.get("tool"))
     at = normalize_text(event.get("at"), now_iso())
-    from_agent = normalize_text(event.get("from"), "unknown_agent")
+    from_agent = normalize_text(read_arg(event, "from_agent", "from"), "unknown_agent")
     args = event.get("arguments") if isinstance(event.get("arguments"), dict) else {}
 
     if tool == "eventline.create_tree":
-        tree_id = normalize_text(args.get("treeId"), "main")
+        tree_id = normalize_text(read_arg(args, "tree_id", "treeId"), "main")
         title = normalize_text(args.get("title"), tree_id)
         ensure_tree(graph, tree_id, from_agent, at, title)
         return
 
     if tool == "eventline.upsert_node":
-        node_id = normalize_text(args.get("id"))
+        node_id = normalize_text(read_arg(args, "node_id", "id"))
         if not node_id:
-            graph.notices.append(f"seq {event.get('seq')}: eventline.upsert_node requires id")
+            graph.notices.append(f"seq {event.get('seq')}: eventline.upsert_node requires node_id")
             return
         existing = graph.nodes.get(node_id)
-        tree_id = normalize_text(args.get("treeId"), existing.tree_id if existing else "main")
+        tree_id = normalize_text(read_arg(args, "tree_id", "treeId"), existing.tree_id if existing else "main")
         ensure_tree(graph, tree_id, from_agent, at)
         title = normalize_text(args.get("title"), existing.title if existing else node_id)
         detail = normalize_text(args.get("detail"), existing.detail if existing else "No detail was provided.")
@@ -576,14 +629,14 @@ def apply_event(graph: EventGraph, event: dict[str, Any]) -> None:
             args.get("versionId"),
             version_id_for(
                 {
-                    "id": node_id,
-                    "treeId": tree_id,
+                    "node_id": node_id,
+                    "tree_id": tree_id,
                     "title": title,
                     "detail": detail,
                     "icon": icon,
                     "attachments": normalized_attachments,
                     "at": at,
-                    "from": from_agent,
+                    "from_agent": from_agent,
                 }
             ),
         )
@@ -607,7 +660,7 @@ def apply_event(graph: EventGraph, event: dict[str, Any]) -> None:
             updated_by=from_agent,
             versions=[*(existing.versions if existing else []), version],
         )
-        edge_label = normalize_text(args.get("edgeLabel"))
+        edge_label = normalize_text(read_arg(args, "edge_label", "edgeLabel"))
         for source_ref in normalize_after(args.get("after")):
             source = resolve_node_ref(graph, source_ref)
             if not source:
@@ -633,7 +686,7 @@ def apply_event(graph: EventGraph, event: dict[str, Any]) -> None:
             graph.notices.append(f"seq {event.get('seq')}: eventline.connect_events skipped; {'; '.join(missing)}")
             return
         tree_id = normalize_text(
-            args.get("treeId"),
+            read_arg(args, "tree_id", "treeId"),
             graph.nodes[target].tree_id if target in graph.nodes else graph.nodes[source].tree_id if source in graph.nodes else "main",
         )
         ensure_tree(graph, tree_id, from_agent, at)
@@ -641,15 +694,15 @@ def apply_event(graph: EventGraph, event: dict[str, Any]) -> None:
         return
 
     if tool == "eventline.delete":
-        node_ref = normalize_text(args.get("nodeId"))
-        edge_id = normalize_text(args.get("edgeId"))
+        node_ref = normalize_text(read_arg(args, "node_id", "nodeId"))
+        edge_id = normalize_text(read_arg(args, "edge_id", "edgeId"))
         if node_ref and edge_id:
-            graph.notices.append(f"seq {event.get('seq')}: eventline.delete accepts nodeId or edgeId, not both")
+            graph.notices.append(f"seq {event.get('seq')}: eventline.delete accepts node_id or edge_id, not both")
             return
         if node_ref:
             node_id = resolve_node_ref(graph, node_ref)
             if node_id not in graph.nodes:
-                graph.notices.append(f"seq {event.get('seq')}: {node_ref_error(graph, 'nodeId', node_ref)}")
+                graph.notices.append(f"seq {event.get('seq')}: {node_ref_error(graph, 'node_id', node_ref)}")
                 return
             del graph.nodes[node_id]
             graph.edges = {
@@ -662,7 +715,7 @@ def apply_event(graph: EventGraph, event: dict[str, Any]) -> None:
                 return
             del graph.edges[edge_id]
             return
-        graph.notices.append(f"seq {event.get('seq')}: eventline.delete requires nodeId or edgeId")
+        graph.notices.append(f"seq {event.get('seq')}: eventline.delete requires node_id or edge_id")
 
 
 def add_edge(
@@ -821,8 +874,6 @@ def access_markdown(graph: EventGraph, params: AccessInput) -> str:
     return "\n".join(lines)
 
 
-mcp = FastMCP("eventline_mcp")
-
 
 @mcp.tool(name="create_tree", annotations={"title": "Create Eventline Tree", "readOnlyHint": False})
 async def create_tree(params: CreateTreeInput) -> str:
@@ -831,7 +882,7 @@ async def create_tree(params: CreateTreeInput) -> str:
     event = append_event(
         "eventline.create_tree",
         params.from_agent,
-        {"treeId": params.tree_id, "title": params.title},
+        {"tree_id": params.tree_id, "title": params.title},
         params.at,
     )
     return json.dumps({"ok": True, "seq": event["seq"], "tree_id": params.tree_id}, ensure_ascii=False)
@@ -842,8 +893,8 @@ async def upsert_node(params: UpsertNodeInput) -> str:
     """Create or update an event node. Existing node ids preserve prior versions in replayed state."""
 
     arguments: dict[str, Any] = {
-        "id": params.id,
-        "treeId": params.tree_id,
+        "node_id": params.node_id,
+        "tree_id": params.tree_id,
         "title": params.title,
         "detail": params.detail,
     }
@@ -856,11 +907,11 @@ async def upsert_node(params: UpsertNodeInput) -> str:
             for source_ref in normalize_after(params.after)
         ]
     if params.edge_label:
-        arguments["edgeLabel"] = params.edge_label
+        arguments["edge_label"] = params.edge_label
     if params.attachments:
         arguments["attachments"] = [item.model_dump() for item in params.attachments]
     event = append_event("eventline.upsert_node", params.from_agent, arguments, params.at)
-    return json.dumps({"ok": True, "seq": event["seq"], "node_id": params.id}, ensure_ascii=False)
+    return json.dumps({"ok": True, "seq": event["seq"], "node_id": params.node_id}, ensure_ascii=False)
 
 
 @mcp.tool(name="connect_events", annotations={"title": "Connect Eventline Events", "readOnlyHint": False})
@@ -874,7 +925,7 @@ async def connect_events(params: ConnectEventsInput) -> str:
     if params.id:
         arguments["id"] = params.id
     if params.tree_id:
-        arguments["treeId"] = params.tree_id
+        arguments["tree_id"] = params.tree_id
     if params.label:
         arguments["label"] = params.label
     event = append_event("eventline.connect_events", params.from_agent, arguments, params.at)
@@ -887,9 +938,9 @@ async def delete(params: DeleteInput) -> str:
 
     arguments: dict[str, Any] = {}
     if params.node_id:
-        arguments["nodeId"] = require_node_ref(current_graph(), "node_id", params.node_id)
+        arguments["node_id"] = require_node_ref(current_graph(), "node_id", params.node_id)
     if params.edge_id:
-        arguments["edgeId"] = require_edge_id(current_graph(), params.edge_id)
+        arguments["edge_id"] = require_edge_id(current_graph(), params.edge_id)
     if params.reason:
         arguments["reason"] = params.reason
     event = append_event("eventline.delete", params.from_agent, arguments, params.at)
@@ -898,9 +949,11 @@ async def delete(params: DeleteInput) -> str:
 
 @mcp.tool(name="access", annotations={"title": "Access Eventline State", "readOnlyHint": True})
 async def access(params: AccessInput) -> str:
-    """Return the current eventline graph as agent-readable Markdown."""
+    """Return the current eventline graph as agent-readable Markdown or a rendered image path."""
 
     graph = replay_events(read_events())
+    if params.mode == "img":
+        return json.dumps(request_backend_image_export(), ensure_ascii=False)
     markdown = access_markdown(graph, params)
     if graph.notices:
         markdown += "\n\n## notices\n" + "\n".join(f"- {notice}" for notice in graph.notices)
@@ -910,11 +963,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Standalone Eventline MCP server.")
     parser.add_argument("--events", help="Path to events.jsonl. Defaults to eventline/data/events.jsonl.")
     parser.add_argument("--print-tool-schema", action="store_true", help="Print MCP tool schema metadata as JSON and exit.")
+    parser.add_argument("--access-img", action="store_true", help="Trigger backend image export and print the rendered eventline image path.")
     args = parser.parse_args()
     if args.events:
         os.environ["EVENTLINE_EVENTS_PATH"] = str(Path(args.events).expanduser().resolve())
     if args.print_tool_schema:
         print(json.dumps(tool_schema_payload(), ensure_ascii=False, indent=2))
+        return
+    if args.access_img:
+        print(json.dumps(request_backend_image_export(), ensure_ascii=False))
         return
     try:
         mcp.run(transport="stdio")

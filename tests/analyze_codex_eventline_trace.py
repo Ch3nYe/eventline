@@ -88,14 +88,16 @@ def main() -> int:
 
     event_tools = Counter(event.get("tool", "") for event in events)
     delete_nodes = [
-        event.get("arguments", {}).get("nodeId")
+        event.get("arguments", {}).get("node_id") or event.get("arguments", {}).get("nodeId")
         for event in events
-        if event.get("tool") == "eventline.delete" and event.get("arguments", {}).get("nodeId")
+        if event.get("tool") == "eventline.delete"
+        and (event.get("arguments", {}).get("node_id") or event.get("arguments", {}).get("nodeId"))
     ]
     delete_edges = [
-        event.get("arguments", {}).get("edgeId")
+        event.get("arguments", {}).get("edge_id") or event.get("arguments", {}).get("edgeId")
         for event in events
-        if event.get("tool") == "eventline.delete" and event.get("arguments", {}).get("edgeId")
+        if event.get("tool") == "eventline.delete"
+        and (event.get("arguments", {}).get("edge_id") or event.get("arguments", {}).get("edgeId"))
     ]
     edge_refs_with_slash = [
         event

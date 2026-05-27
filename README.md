@@ -38,6 +38,41 @@ Run the standalone MCP server:
 uv run python mcp_server.py --events data/events.jsonl
 ```
 
+Use STDIO transport when connecting from a standard MCP client. Example config:
+
+```json
+{
+  "mcpServers": {
+    "eventline": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "--directory",
+        ".",
+        "run",
+        "python",
+        "mcp_server.py",
+        "--events",
+        "data/events.jsonl"
+      ]
+    }
+  }
+}
+```
+
+Debug with MCP Inspector:
+
+```bash
+npx @modelcontextprotocol/inspector \
+  uv \
+  --directory . \
+  run \
+  python \
+  mcp_server.py \
+  --events \
+  data/events.jsonl
+```
+
 Available tools:
 
 - `eventline.create_tree`
